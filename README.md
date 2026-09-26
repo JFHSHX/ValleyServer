@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="icon.jpg" width="180" alt="ValleyServer" />
+<img src="icon-round.png" width="180" alt="ValleyServer" />
 
 # ValleyServer
 
