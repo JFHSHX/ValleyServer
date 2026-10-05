@@ -67,6 +67,28 @@ namespace HeadlessServer
                 usage: "roll",
                 description: "Forces an overnight NewDay roll (host sleeps immediately, no clients needed).",
                 handler: _ => ForceDayRoll()));
+
+            commandRegistry.Register(new ServerCommand(
+                name: "housediag",
+                usage: "housediag",
+                description: "Lists cabin/farmhouse interiors and furniture counts.",
+                handler: _ => HouseDiag()));
+        }
+
+        private static void HouseDiag()
+        {
+            var farm = Game1.getFarm();
+            int seen = 0;
+            foreach (var b in farm.buildings)
+            {
+                try
+                {
+                    var indoors = b.GetIndoors();
+                    Console.WriteLine($"[HouseDiag] building={b.buildingType.Value} indoors={indoors?.NameOrUniqueName ?? "null"} furniture={indoors?.furniture.Count}");
+                }
+                catch (Exception ex) { Console.WriteLine($"[HouseDiag] {b.buildingType?.Value}: {ex.Message}"); }
+                if (++seen > 12) break;
+            }
         }
 
         private static void PumpCommandFile()

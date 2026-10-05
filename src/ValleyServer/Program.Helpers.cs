@@ -68,11 +68,34 @@ namespace HeadlessServer
             foreach (var building in farm.buildings)
             {
                 try { building.load(); } catch (Exception ex) { Console.WriteLine($"[FarmInit] Failed to load {building.buildingType.Value}: {ex.Message}"); }
-                if (building.GetIndoors() is FarmHouse house && house.GetPlayerBed() == null)
+                if (building.GetIndoors() is FarmHouse house)
                 {
-                    house.furniture.Add(new BedFurniture(BedFurniture.DEFAULT_BED_INDEX, new Vector2(9f, 8f)));
-                    Console.WriteLine($"[FarmInit] Added fallback bed to {house.NameOrUniqueName}.");
-                }
+                    if (house.GetPlayerBed() == null)
+                    {
+                        house.furniture.Add(new BedFurniture(BedFurniture.DEFAULT_BED_INDEX, new Vector2(9f, 8f)));
+                        Console.WriteLine($"[FarmInit] Added fallback bed to {house.NameOrUniqueName}.");
+                    }
+                    // Cabin interiors end up nearly empty in the headless path, leaving
+                    // players a bare room. Furnish the vanilla cabin basics.
+                    if (house.furniture.Count <= 2)
+                    {
+                        try
+                        {
+                            foreach (var (id, tile) in new (string, Vector2)[] {
+                                ("(F)1792", house.getFireplacePoint().ToVector2()),
+                                ("(F)1614", new Vector2(4f, 3f)),
+                                ("(F)1376", new Vector2(2f, 4f)),
+                                ("(F)0",    new Vector2(3f, 4f)) })
+                            {
+                                var f = ItemRegistry.Create<StardewValley.Objects.Furniture>(id);
+                                f.SetPlacement(tile);
+                                house.furniture.Add(f);
+                            }
+                            Console.WriteLine($"[FarmInit] Furnished cabin interior {house.NameOrUniqueName}.");
+                        }
+                        catch (Exception ex) { Console.WriteLine($"[FarmInit] Furnishing failed for {house.NameOrUniqueName}: {ex.Message}"); }
+                    }
+            }
             }
             foreach (var farmer in Game1.otherFarmers.Values)
             {
