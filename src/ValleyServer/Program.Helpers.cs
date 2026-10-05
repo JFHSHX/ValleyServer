@@ -81,17 +81,13 @@ namespace HeadlessServer
                     {
                         try
                         {
-                            foreach (var (id, tile) in new (string, Vector2)[] {
-                                ("(F)1792", house.getFireplacePoint().ToVector2()),
-                                ("(F)1614", new Vector2(4f, 3f)),
-                                ("(F)1376", new Vector2(2f, 4f)),
-                                ("(F)0",    new Vector2(3f, 4f)) })
-                            {
-                                // GetFurnitureInstance picks the vanilla subclass and runs
-                                // InitializeAtTile so sourceRect/rotation render correctly.
-                                var f = StardewValley.Objects.Furniture.GetFurnitureInstance(id, tile);
-                                house.furniture.Add(f);
-                            }
+                            // Vanilla cabin interior is minimal: a bed plus a fireplace at its
+                            // map-designated point. Skip extras to avoid wrong textures.
+                            var f = StardewValley.Objects.Furniture.GetFurnitureInstance("(F)1792", house.getFireplacePoint().ToVector2());
+                            house.furniture.Add(f);
+                            // Budget TV by the bed, matching the vanilla cabin starter set.
+                            var tv = StardewValley.Objects.Furniture.GetFurnitureInstance("(F)1468", new Vector2(3f, 3f));
+                            house.furniture.Add(tv);
                             Console.WriteLine($"[FarmInit] Furnished cabin interior {house.NameOrUniqueName}.");
                         }
                         catch (Exception ex) { Console.WriteLine($"[FarmInit] Furnishing failed for {house.NameOrUniqueName}: {ex.Message}"); }
@@ -102,6 +98,16 @@ namespace HeadlessServer
             {
                 try
                 {
+                    // Saved farmhands may carry a homeLocation GUID from a previous session's
+                    // world (interior GUIDs regenerate each boot). A stale name makes clients
+                    // crash in BedFurniture.ApplyWakeUpPosition -> RequireLocation on join.
+                    string? homeName = farmer.homeLocation.Value;
+                    bool stale = !string.IsNullOrEmpty(homeName) && Game1.getLocationFromName(homeName) == null;
+                    if (stale)
+                    {
+                        Console.WriteLine($"[FarmhandHome] {farmer.UniqueMultiplayerID} home {homeName} no longer exists; clearing for reassignment.");
+                        farmer.homeLocation.Value = null;
+                    }
                     bool assigned = Game1.netWorldState.Value.TryAssignFarmhandHome(farmer);
                     Console.WriteLine($"[FarmhandHome] {farmer.UniqueMultiplayerID} home={farmer.homeLocation.Value}, assigned={assigned}.");
                     if (Game1.getLocationFromName(farmer.homeLocation.Value) is FarmHouse home && home.GetPlayerBed() == null)
@@ -393,6 +399,15 @@ namespace HeadlessServer
                 return;
 
             SyncDisconnectingFarmers();
+
+            // Festivals also gate on a ready check; the invisible host must say yes
+            // or single-player clients hang on "waiting for players" forever.
+            int festReady = Game1.netReady.GetNumberReady("festivalStart");
+            int festRequired = Game1.netReady.GetNumberRequired("festivalStart");
+            if (festRequired > 0 && festReady >= clientConnections.Count)
+            {
+                Game1.netReady.SetLocalReady("festivalStart", true);
+            }
 
             int ready = Game1.netReady.GetNumberReady("sleep");
             int required = Game1.netReady.GetNumberRequired("sleep");
