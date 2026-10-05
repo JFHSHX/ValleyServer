@@ -282,14 +282,59 @@ namespace HeadlessServer
             while (headlessClockAccumulatorMs >= millisecondsPerTenMinutes)
             {
                 headlessClockAccumulatorMs -= millisecondsPerTenMinutes;
-                int minutes = Game1.timeOfDay % 100 + 10;
-                int hours = Game1.timeOfDay / 100;
-                if (minutes >= 60)
+                // Vanilla schedule engine lives in Game1.addMinute() (called from
+                // UpdateGameClock), but that method also runs presentation code
+                // (keyboard state, music) that a headless host cannot support. Replicate
+                // its gameplay core here: time advance, per-location checkSchedule for
+                // every NPC, ten-minute location updates, and lightning.
+                int timeOfDay = Game1.timeOfDay + 10;
+                if (timeOfDay % 100 == 60) timeOfDay += 40;
+                if (timeOfDay % 100 == 90) timeOfDay -= 40;
+                Game1.timeOfDay = Math.Min(timeOfDay, 2600);
+
+                try
                 {
-                    hours++;
-                    minutes -= 60;
+                    Game1.currentLocation?.performTenMinuteUpdate(Game1.timeOfDay);
                 }
-                Game1.timeOfDay = Math.Min(hours * 100 + minutes, 2600);
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[HeadlessClock] performTenMinuteUpdate failed at {Game1.timeOfDay}: {ex.Message}");
+                }
+
+                foreach (GameLocation location in Game1.locations)
+                {
+                    if (location == null) continue;
+                    try
+                    {
+                        for (int i = location.characters.Count - 1; i >= 0; i--)
+                        {
+                            location.characters[i].checkSchedule(Game1.timeOfDay);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        string key = location.NameOrUniqueName;
+                        if (!loggedLocationErrors.TryGetValue(key, out string? prev2) || prev2 != ex.Message)
+                        {
+                            loggedLocationErrors[key] = ex.Message;
+                            Console.WriteLine($"[HeadlessClock] checkSchedule {key}: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (Game1.timeOfDay is 1900 or 2000)
+                {
+                    try
+                    {
+                        Game1.currentLocation?.switchOutNightTiles();
+                    }
+                    catch { /* night-tile visuals need content; ambience only */ }
+                }
+                if (Game1.isLightning && Game1.IsMasterGame)
+                {
+                    try { Utility.performLightningUpdate(Game1.timeOfDay); }
+                    catch (Exception ex) { Console.WriteLine($"[HeadlessClock] lightning update failed: {ex.Message}"); }
+                }
             }
         }
 
@@ -529,6 +574,23 @@ namespace HeadlessServer
                     headlessNewDayActive = false;
                     headlessNewDayThread = null;
                     try { Game1.timeOfDay = 600; Game1.netWorldState?.Value?.UpdateFromGame1(); } catch { }
+                    // The headless night end never runs the SaveGameMenu that would normally
+                    // pop itself and wake the host. Clear the end-of-night state manually or
+                    // Game1.shouldTimePass() stays false forever (menus freeze time), blocking
+                    // the NPC schedule clock and every time-gated update system.
+                    try
+                    {
+                        Game1.showingEndOfNightStuff = false;
+                        Game1.endOfNightMenus?.Clear();
+                        if (Game1.activeClickableMenu is StardewValley.Menus.SaveGameMenu)
+                            Game1.activeClickableMenu = null;
+                        if (Game1.player != null)
+                        {
+                            Game1.player.isInBed.Value = false;
+                            Game1.player.timeWentToBed.Value = 0;
+                        }
+                    }
+                    catch (Exception ex) { Console.WriteLine($"[HeadlessNewDay] wake-up cleanup failed: {ex.Message}"); }
                     Console.WriteLine($"[HeadlessNewDay] newDay cleared (time reset to {Game1.timeOfDay}).");
                     Console.WriteLine(DescribeNewDayState("worker-finally"));
                 }

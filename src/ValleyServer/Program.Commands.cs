@@ -30,6 +30,8 @@ namespace HeadlessServer
                 description: "Save every farmhand, disconnect clients and exit.",
                 handler: _ => RequestGracefulShutdown("the stop command"),
                 aliases: new[] { "shutdown", "quit" }));
+
+            RegisterDiagnosticCommands();
         }
 
         /// <summary>
@@ -38,6 +40,7 @@ namespace HeadlessServer
         /// </summary>
         private static void PumpConsoleCommands()
         {
+            PumpCommandFile();
             ConsoleCommandReader.Drain(line =>
             {
                 string[] tokens = ServerCommandRegistry.Tokenize(line);
