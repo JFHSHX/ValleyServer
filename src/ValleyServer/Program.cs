@@ -452,6 +452,20 @@ namespace HeadlessServer
                 Game1.flushLocationLookup();
                 Console.WriteLine("Recovered canonical Town location using StardewValley.Locations.Town.");
             }
+            // Vanilla Game1.loadForNewGame builds the warp route cache used by NPC
+            // schedule pathfinding (getLocationRoute). Without it, cross-map schedule
+            // entries resolve to a single in-map path ending in target-map tile
+            // coordinates, so NPCs walk past map edges instead of using doors/warps.
+            try
+            {
+                StardewValley.Pathfinding.WarpPathfindingCache.PopulateCache();
+                Console.WriteLine("WarpPathfindingCache populated for NPC schedule routing.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WarpCache] PopulateCache failed: {ex.Message}");
+            }
+
             foreach (GameLocation location in locList)
             {
                 multiplayer?.locationRoot(location);

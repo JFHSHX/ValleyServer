@@ -254,19 +254,32 @@ namespace HeadlessServer
                 return;
             }
             Console.WriteLine($"[Probe] {name}@{loc.Name} pos={npc.Position} dir2loc={(npc.DirectionsToNewLocation == null ? "null" : "set")} square={npc.IsWalkingInSquare} ctrl={(npc.controller == null ? "null" : npc.controller.pathToEndPoint?.Count.ToString())} timeNow={Game1.timeOfDay} shouldPass={Game1.shouldTimePass()} master={Game1.IsMasterGame}");
+            if (npc.controller?.pathToEndPoint != null)
+            {
+                var pts = npc.controller.pathToEndPoint.ToArray(); // Stack: [0]=next target
+                Console.WriteLine($"[Probe] path[{pts.Length}] next5=[{string.Join(" ", pts.Take(5).Select(p => $"({p.X},{p.Y})"))}] ... end1..5=[{string.Join(" ", pts.Skip(Math.Max(0, pts.Length - 5)).Select(p => $"({p.X},{p.Y})"))}]");
+                var d = npc.DirectionsToNewLocation;
+                if (d != null)
+                    Console.WriteLine($"[Probe] scheduleTarget: {d.targetLocationName} ({d.targetTile.X},{d.targetTile.Y}) facing={d.facingDirection} behavior={d.endOfRouteBehavior}");
+            }
             var time = Game1.currentGameTime ?? new GameTime();
-            for (int i = 1; i <= 240; i++)
+            int maxTicks = 20000;
+            for (int i = 1; i <= maxTicks; i++)
             {
                 time = new GameTime(time.TotalGameTime + TimeSpan.FromMilliseconds(16), TimeSpan.FromMilliseconds(16));
                 Game1.currentGameTime = time;
-                try { loc.updateEvenIfFarmerIsntHere(time, false); }
-                catch (Exception ex) { Console.WriteLine($"[Probe] tick{i} error: {ex.Message}"); break; }
-                if (i % 60 == 0)
+                foreach (GameLocation l2 in Game1.locations)
                 {
-                    Console.WriteLine($"[Probe]   tick{i}: pos={npc.Position} ctrl={(npc.controller == null ? "null" : npc.controller.pathToEndPoint?.Count.ToString())} loc={npc.currentLocation?.Name}");
+                    if (l2 == null) continue;
+                    try { l2.updateEvenIfFarmerIsntHere(time, false); }
+                    catch { /* sweep errors are already logged by the main loop */ }
+                }
+                if (i % 240 == 0)
+                {
+                    Console.WriteLine($"[Probe]   tick{i}: pos={npc.Position} ctrl={(npc.controller == null ? "null" : npc.controller.pathToEndPoint?.Count.ToString())} loc={npc.currentLocation?.Name} dir2loc={(npc.DirectionsToNewLocation == null ? "null" : "set")}");
                 }
             }
-            Console.WriteLine($"[Probe] done: {name}@{loc.Name} pos={npc.Position}");
+            Console.WriteLine($"[Probe] done: {name} now in {npc.currentLocation?.Name} pos={npc.Position}");
         }
 
         private static void ForceDayRoll()
