@@ -87,8 +87,9 @@ namespace HeadlessServer
                                 ("(F)1376", new Vector2(2f, 4f)),
                                 ("(F)0",    new Vector2(3f, 4f)) })
                             {
-                                var f = ItemRegistry.Create<StardewValley.Objects.Furniture>(id);
-                                f.SetPlacement(tile);
+                                // GetFurnitureInstance picks the vanilla subclass and runs
+                                // InitializeAtTile so sourceRect/rotation render correctly.
+                                var f = StardewValley.Objects.Furniture.GetFurnitureInstance(id, tile);
                                 house.furniture.Add(f);
                             }
                             Console.WriteLine($"[FarmInit] Furnished cabin interior {house.NameOrUniqueName}.");
