@@ -1,6 +1,7 @@
 #pragma warning disable SYSLIB0050
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.Serialization;
@@ -115,6 +116,34 @@ namespace HeadlessServer
             return (T)asset;
         }
 
+        private static Microsoft.Xna.Framework.Graphics.SpriteFont? _inertSpriteFont;
+
+        private static Microsoft.Xna.Framework.Graphics.SpriteFont GetInertSpriteFont()
+        {
+            if (_inertSpriteFont == null)
+            {
+                // Menus built on the headless server (e.g. ReadyCheckDialog via
+                // DedicatedServer.HostSleepInBed -> startSleep) call MeasureString and
+                // parseText before anything would ever be rendered; an uninitialized
+                // SpriteFont made those constructors throw NullReferenceException.
+                // A real font with a single blank 8x16 glyph satisfies every query.
+                var glyphBounds = new List<Microsoft.Xna.Framework.Rectangle> { new Microsoft.Xna.Framework.Rectangle(0, 0, 8, 16) };
+                var cropping = new List<Microsoft.Xna.Framework.Rectangle> { new Microsoft.Xna.Framework.Rectangle(0, 0, 0, 0) };
+                var characters = new List<char> { ' ' };
+                var kerning = new List<Microsoft.Xna.Framework.Vector3> { new Microsoft.Xna.Framework.Vector3(0f, 8f, 0f) };
+                _inertSpriteFont = new Microsoft.Xna.Framework.Graphics.SpriteFont(
+                    CreateHeadlessAsset<Microsoft.Xna.Framework.Graphics.Texture2D>(),
+                    glyphBounds,
+                    cropping,
+                    characters,
+                    16,
+                    0f,
+                    kerning,
+                    ' ');
+            }
+            return _inertSpriteFont;
+        }
+
         public override T Load<T>(string assetName)
         {
             if (typeof(T) == typeof(Microsoft.Xna.Framework.Graphics.Texture2D))
@@ -123,7 +152,7 @@ namespace HeadlessServer
             }
             if (typeof(T) == typeof(Microsoft.Xna.Framework.Graphics.SpriteFont))
             {
-                return (T)(object)FormatterServices.GetUninitializedObject(typeof(Microsoft.Xna.Framework.Graphics.SpriteFont));
+                return (T)(object)GetInertSpriteFont();
             }
             return base.Load<T>(assetName);
         }
@@ -136,7 +165,7 @@ namespace HeadlessServer
             }
             if (typeof(T) == typeof(Microsoft.Xna.Framework.Graphics.SpriteFont))
             {
-                return (T)(object)FormatterServices.GetUninitializedObject(typeof(Microsoft.Xna.Framework.Graphics.SpriteFont));
+                return (T)(object)GetInertSpriteFont();
             }
             return base.Load<T>(assetName, language);
         }
@@ -149,7 +178,7 @@ namespace HeadlessServer
             }
             if (typeof(T) == typeof(Microsoft.Xna.Framework.Graphics.SpriteFont))
             {
-                return (T)(object)FormatterServices.GetUninitializedObject(typeof(Microsoft.Xna.Framework.Graphics.SpriteFont));
+                return (T)(object)GetInertSpriteFont();
             }
             return base.LoadImpl<T>(baseAssetName, localizedAssetName, languageCode);
         }

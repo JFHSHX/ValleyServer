@@ -168,6 +168,7 @@ namespace HeadlessServer
             config.World.HostName = config.World.HostName?.Trim() ?? "";
             config.Paths.ContentPath = config.Paths.ContentPath?.Trim() ?? "";
             config.Paths.SaveDirectory = config.Paths.SaveDirectory?.Trim() ?? "";
+            config.Paths.WorldSavesFolder = config.Paths.WorldSavesFolder?.Trim() ?? "";
             config.Paths.SaveSlotName = config.Paths.SaveSlotName?.Trim() ?? "";
         }
 
@@ -250,7 +251,9 @@ namespace HeadlessServer
                               $"World.MaxFarmhands={world.MaxFarmhands} World.StarterParsnipSeeds={world.StarterParsnipSeeds} " +
                               $"World.StartFreshWhenSaveUnreadable={world.StartFreshWhenSaveUnreadable}");
             Console.WriteLine($"[Config]   Simulation.MillisecondsPerTenMinutes={config.Simulation.MillisecondsPerTenMinutes}");
-            Console.WriteLine($"[Config]   Paths.ContentPath={contentPath} Paths.SaveDirectory={config.Paths.SaveDirectory} Paths.SaveSlotName={config.Paths.SaveSlotName}");
+            Console.WriteLine($"[Config]   Paths.ContentPath={contentPath} Paths.SaveDirectory={config.Paths.SaveDirectory} " +
+                              $"Paths.WorldSavesFolder={(string.IsNullOrWhiteSpace(config.Paths.WorldSavesFolder) ? "(game default)" : config.Paths.WorldSavesFolder)} " +
+                              $"Paths.SaveSlotName={config.Paths.SaveSlotName}");
         }
     }
 }

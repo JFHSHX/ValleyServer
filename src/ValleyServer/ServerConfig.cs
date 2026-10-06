@@ -114,10 +114,32 @@ namespace HeadlessServer
             public string SaveDirectory { get; set; } = "saved_farmhands";
 
             /// <summary>
-            /// Name of the vanilla save slot folder (inside the game's Saves folder) to
-            /// restore the world from on startup, e.g. <c>HeadlessFarm_63926782547</c>.
-            /// Empty auto-detects the newest slot for the configured farm name; no slot
-            /// found falls back to creating a fresh world.
+            /// Directory holding the world save slots, so saves travel with the
+            /// server deployment instead of living in the OS's per-user app-data
+            /// folder (<c>%APPDATA%\StardewValley\Saves</c> on Windows,
+            /// <c>~/.config/StardewValley/Saves</c> on Linux) where a cloud
+            /// service account or fresh box would not find them. A relative path
+            /// resolves against the executable directory. Empty keeps the
+            /// vanilla folder exactly as the single-player game uses it.
+            ///
+            /// The vanilla save pipeline resolves its folder through
+            /// <c>StardewValley.Program.GetSavesFolder()</c>, which 1.6.15 computes
+            /// from the OS with no settable field, so a non-empty value redirects
+            /// that method with a runtime detour (see
+            /// <see cref="HeadlessSaveFolder"/>). If the redirected folder holds no
+            /// slot for the configured farm name while the vanilla folder does,
+            /// the server refuses to start rather than silently building a fresh
+            /// world that shadows the operator's progress.
+            /// </summary>
+            public string WorldSavesFolder { get; set; } = "saves";
+
+            /// <summary>
+            /// Name of the vanilla save slot folder (inside
+            /// <see cref="WorldSavesFolder"/>, or the game's own Saves folder when
+            /// that is empty) to restore the world from on startup, e.g.
+            /// <c>HeadlessFarm_63926782547</c>. Empty auto-detects the newest slot
+            /// for the configured farm name; no slot found falls back to creating
+            /// a fresh world.
             /// </summary>
             public string SaveSlotName { get; set; } = "";
         }

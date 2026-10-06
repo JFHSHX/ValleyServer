@@ -494,10 +494,22 @@ namespace HeadlessServer
             }
 
             // Drive the vanilla NewDay once readycheck finishes or when all active clients + host are in bed
-            if (hostSleepTriggered && !Game1.newDay)
+            if (hostSleepTriggered && !Game1.newDay && Game1.netReady.IsReady("sleep"))
             {
                 hostSleepTriggered = false;
-                Console.WriteLine($"[HeadlessNewDay] Sleep check satisfied; starting NewDay (time {Game1.timeOfDay}, day {Game1.dayOfMonth})...");
+                // Vanilla's ReadyCheckDialog only calls doSleep() after IsReady("sleep")
+                // has been ACK-confirmed by every peer - plain vote counts (e.g. 2/2) are
+                // not sufficient (live51 showed ready=2/2 with isReady=False). Firing
+                // NewDay earlier would start the 14-start roll while a client is still
+                // inside its own "waiting for other players" dialog.
+                // startSleep() also assigned the host's own ReadyCheckDialog; a headless
+                // host never runs menu updates, so close it the way vanilla's doSleep would.
+                if (Game1.activeClickableMenu is StardewValley.Menus.ReadyCheckDialog)
+                {
+                    Game1.activeClickableMenu = null;
+                    Game1.dialogueUp = false;
+                }
+                Console.WriteLine($"[HeadlessNewDay] Sleep check satisfied (isReady=True); starting NewDay (time {Game1.timeOfDay}, day {Game1.dayOfMonth})...");
                 try
                 {
                     Game1.NewDay(0f);

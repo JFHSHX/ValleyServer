@@ -275,6 +275,11 @@ namespace HeadlessServer
             string targetVersion = actualProtocolVersion ?? "1.6.15";
             Console.WriteLine($"Protocol Version to use: {targetVersion}");
 
+            // Redirect the world saves folder beside the server before any save
+            // or load can resolve a path (the vanilla pipeline and our helpers
+            // all go through StardewValley.Program.GetSavesFolder lazily).
+            HeadlessSaveFolder.Install();
+
             // 3. Initialize Game1 static state using uninitialized objects and reflection
             Console.WriteLine("Mocking Game1 static fields...");
             
