@@ -32,13 +32,27 @@ namespace HeadlessServer
 {
     partial class Program
     {
-        static Dictionary<long, NetConnection> clientConnections = new Dictionary<long, NetConnection>();
+        // Written by the main loop (join/disconnect) and read from the day-roll worker thread
+        // ([HeadlessNewDay] monitor lines, HeadlessGameServer's sync sends), so it must be a
+        // concurrent collection: a plain Dictionary could throw or corrupt under that race.
+        static ConcurrentDictionary<long, NetConnection> clientConnections = new ConcurrentDictionary<long, NetConnection>();
         static string? actualProtocolVersion = null;
         static long headlessClockAccumulatorMs = 0;
         static long headlessSimulationTimeMs = 0;
         static bool discardNextHeadlessClockElapsed = false;
         static readonly HashSet<long> serverModifiedFarmerIds = new HashSet<long>();
+        // The debris self-test farmer's id. It is never a real farmhand: clients may not claim it,
+        // and saves written by older builds that left it behind have it purged on load.
+        internal const long SelfTestFarmerId = 88888888L;
         private static readonly ConcurrentQueue<IncomingMessage> deferredOvernightMessages = new();
+        // Farmhands that finished their handshake while a day roll was running. The roll iterates
+        // Game1.otherFarmers on its worker thread, so adding a root there can abort the roll (and
+        // that day's save): the registration waits until the roll has finished.
+        private static readonly List<long> pendingFarmhandRegistrations = new();
+        private static readonly Dictionary<long, NetFarmerRoot> pendingFarmhandRoots = new();
+        // Set while a day roll is running so the main loop can notice the transition back and clean
+        // up state that belongs to the finished roll.
+        private static bool rollWasActive = false;
         static readonly FieldInfo gamePlayerField = typeof(Game1).GetField("_player", BindingFlags.Static | BindingFlags.NonPublic)
             ?? throw new MissingFieldException(typeof(Game1).FullName, "_player");
 
@@ -456,14 +470,39 @@ namespace HeadlessServer
                 // The character-selection catalog is loaded from XML below; also include
                 // the farmhands restored from the world save so returning players see
                 // every farmer that ever existed in this world.
-                foreach (long key in Game1.netWorldState.Value.farmhandData.Keys)
+                // Copy the keys first: purging the self-test phantom below mutates farmhandData.
+                bool purgedSelfTestPhantom = false;
+                foreach (long key in new List<long>(Game1.netWorldState.Value.farmhandData.Keys))
                 {
+                    if (key == 99999999L)
+                    {
+                        continue;
+                    }
+                    if (key == SelfTestFarmerId)
+                    {
+                        // Builds that did not clean up after the debris self-test wrote this phantom
+                        // farmhand into the save. Drop it here so it is never offered to clients as a
+                        // selectable character and stops being re-saved by every later day roll.
+                        Game1.netWorldState.Value.farmhandData.Remove(key);
+                        purgedSelfTestPhantom = true;
+                        Console.WriteLine($"[World] Removed the debris self-test farmhand {key} that an older build left in the save.");
+                        continue;
+                    }
                     var restoredFarmhand = Game1.netWorldState.Value.farmhandData[key];
-                    if (key != 99999999L && restoredFarmhand != null)
+                    if (restoredFarmhand != null)
                     {
                         savedFarmhandCatalog[key] = restoredFarmhand;
                         savedFarmerIds.Add(key);
                     }
+                }
+                if (purgedSelfTestPhantom)
+                {
+                    // Removing an entry queues an outgoing removal change; vanilla then enumerates that
+                    // list while a re-entrant clean clears it and the next forced world-state write
+                    // dies with "Collection was modified". No client has seen these entries yet, so
+                    // drop the queued changes instead of poisoning the first day roll.
+                    int dropped = DropQueuedNetDictionaryChanges(Game1.netWorldState.Value.farmhandData);
+                    Console.WriteLine($"[World] Dropped {dropped} queued net change(s) for the purged self-test farmhand so it cannot break the next world state write.");
                 }
                 Console.WriteLine($"[World] Restored world: day={Game1.dayOfMonth} year={Game1.year} season={Game1.season} host={Game1.player?.Name}");
             }
@@ -822,8 +861,10 @@ namespace HeadlessServer
                                 }
                                 if (idToRemove != -1)
                                 {
-                                    clientConnections.Remove(idToRemove);
-                                    Console.WriteLine($"Removed mapping for player {idToRemove}");
+                                    if (clientConnections.TryRemove(idToRemove, out _))
+                                    {
+                                        Console.WriteLine($"Removed mapping for player {idToRemove}");
+                                    }
                                     if (clientConnections.Count == 0)
                                     {
                                         Console.WriteLine($"[HeadlessClock] Paused: last active farmhand {idToRemove} disconnected.");
@@ -834,8 +875,20 @@ namespace HeadlessServer
                                     // SaveAllActiveFarmhands above), so it remains selectable the next
                                     // time the player connects.
                                     Game1.otherFarmers.TryGetValue(idToRemove, out var disconnectedFarmer);
-                                    Game1.otherFarmers.Roots.Remove(idToRemove);
-                                    Console.WriteLine($"Removed online farmhand {idToRemove}; kept in selection catalog.");
+                                    if (headlessNewDayActive)
+                                    {
+                                        // The roll's worker thread iterates Game1.otherFarmers inside
+                                        // NetSynchronizer.barrierReady, so removing the root here could
+                                        // abort the roll (and lose that day's save). Mark it instead and
+                                        // let the roll's own message pump remove it between barrier checks.
+                                        MarkFarmhandAsDisconnecting(idToRemove);
+                                        Console.WriteLine($"Deferred removal of online farmhand {idToRemove} to the running day roll; kept in selection catalog.");
+                                    }
+                                    else
+                                    {
+                                        Game1.otherFarmers.Roots.Remove(idToRemove);
+                                        Console.WriteLine($"Removed online farmhand {idToRemove}; kept in selection catalog.");
+                                    }
 
                                     // Notify other clients about the disconnection
                                     if (disconnectedFarmer != null)
@@ -883,8 +936,43 @@ namespace HeadlessServer
                                          long newClientId = clientFarmer.UniqueMultiplayerID;
                                          Console.WriteLine($"Client requested farmhand ID: {newClientId}, Name: {clientFarmer.Name}");
 
-                                         // Register client farmhand
-                                         Game1.otherFarmers.Roots[newClientId] = clientFarmerRoot;
+                                         // Never let a client claim a reserved id, the host's id, or an id a
+                                         // different live connection already owns: that used to evict the earlier
+                                         // client's mapping (whose later disconnect then cleaned up nothing) while
+                                         // both connections kept writing deltas for the same farmhand.
+                                         if (!IsClientFarmhandIdAcceptable(newClientId, inc.SenderConnection))
+                                         {
+                                             Console.WriteLine($"!! Rejected PlayerIntroduction: farmhand id {newClientId} is reserved or already mapped to another live connection.");
+                                             try
+                                             {
+                                                 inc.SenderConnection.Disconnect("That farmhand id is already in use on this server.");
+                                             }
+                                             catch (Exception rejectEx)
+                                             {
+                                                 Console.WriteLine($"Failed to drop the rejected connection {inc.SenderEndPoint}: {rejectEx.Message}");
+                                             }
+                                             break;
+                                         }
+
+                                         // Register client farmhand in the online set. While a day roll is
+                                         // running its worker thread iterates Game1.otherFarmers inside
+                                         // NetSynchronizer.barrierReady, so adding a root here could abort the
+                                         // roll (and lose that day's save): the online registration waits for the
+                                         // roll to finish, while the catalog/farmhandData entries below still
+                                         // register the farmhand immediately.
+                                         if (headlessNewDayActive)
+                                         {
+                                             if (!pendingFarmhandRegistrations.Contains(newClientId))
+                                             {
+                                                 pendingFarmhandRegistrations.Add(newClientId);
+                                             }
+                                             pendingFarmhandRoots[newClientId] = clientFarmerRoot;
+                                             Console.WriteLine($"[Protocol] A day roll is running; deferring the online registration of farmhand {newClientId} until it finishes.");
+                                         }
+                                         else
+                                         {
+                                             Game1.otherFarmers.Roots[newClientId] = clientFarmerRoot;
+                                         }
 
                                          // Keep the selection catalog authoritative for this id as well.
                                          savedFarmhandCatalog[newClientId] = clientFarmer;
@@ -941,8 +1029,8 @@ namespace HeadlessServer
                                          // placements) target the canonical root while the client holds the
                                          // temporary one, so world changes never reach it and its own edits are
                                          // never reconciled with the host's authoritative copy.
-                                         NetRoot<GameLocation> locRoot = multiplayer?.locationRoot(location)
-                                             ?? throw new InvalidOperationException($"Location '{location.NameOrUniqueName}' has no multiplayer NetRoot.");
+                                         NetRoot<GameLocation> locRoot = (location == null ? null : multiplayer?.locationRoot(location))
+                                             ?? throw new InvalidOperationException($"Location '{location?.NameOrUniqueName ?? "Farm"}' has no multiplayer NetRoot.");
                                          byte[] locationBytes = WriteObjectFullBytes(locRoot, newClientId);
 
                                          var locMsg = new OutgoingMessage(3, Game1.player.UniqueMultiplayerID, new object[] { true, locationBytes });
@@ -1160,14 +1248,29 @@ namespace HeadlessServer
                      {
                          if (headlessNewDayActive)
                          {
+                             // The roll's worker thread owns Game1.otherFarmers while it runs, so the
+                             // main loop only observes it here (and may mark unreachable farmhands).
+                             rollWasActive = true;
                              if (currentTime - lastNewDayMonitorMs >= 1000)
                              {
                                  lastNewDayMonitorMs = currentTime;
                                  Console.WriteLine(DescribeNewDayState("monitor"));
                              }
+                             // A wedged farmhand must not freeze the roll (and its day-end save)
+                             // forever; see PumpHeadlessNewDayWatchdog.
+                             PumpHeadlessNewDayWatchdog();
                          }
                          else
                          {
+                             if (rollWasActive)
+                             {
+                                 // The roll just finished, so its worker no longer iterates
+                                 // Game1.otherFarmers: deferred join registrations are safe to apply now,
+                                 // and overnight sync messages still queued belong to a dead generation.
+                                 rollWasActive = false;
+                                 PumpPendingFarmhandRegistrations();
+                                 DropStaleDeferredOvernightMessages();
+                             }
                              mp.UpdateEarly();
                              Game1.dedicatedServer?.Tick();
                              Game1.netReady?.Update();
@@ -1193,7 +1296,11 @@ namespace HeadlessServer
                     // Forward queued messages
                     foreach (var farmer in Game1.otherFarmers.Values)
                     {
-                        if (farmer.messageQueue.Count > 0 && clientConnections.TryGetValue(farmer.UniqueMultiplayerID, out var conn))
+                        if (farmer.messageQueue.Count == 0)
+                        {
+                            continue;
+                        }
+                        if (clientConnections.TryGetValue(farmer.UniqueMultiplayerID, out var conn))
                         {
                             foreach (var outMsg in farmer.messageQueue)
                             {
@@ -1201,8 +1308,15 @@ namespace HeadlessServer
                                 MockLidgrenMessageUtils.WriteMessage(outMsg, msg);
                                 server.SendMessage(msg, conn, NetDeliveryMethod.ReliableOrdered);
                             }
-                            farmer.messageQueue.Clear();
                         }
+                        else
+                        {
+                            Console.WriteLine($"Dropping {farmer.messageQueue.Count} queued message(s) for farmhand {farmer.UniqueMultiplayerID}: it has no mapped connection.");
+                        }
+                        // Clear even without a mapped connection: the queue is transient sync traffic,
+                        // so keeping it would grow without bound and would be flushed as stale news
+                        // the moment the farmhand reconnects.
+                        farmer.messageQueue.Clear();
                     }
 
                     if (Game1.player != null && Game1.player.messageQueue.Count > 0)

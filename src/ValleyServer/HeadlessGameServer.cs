@@ -1,6 +1,7 @@
 #pragma warning disable SYSLIB0050
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Lidgren.Network;
 using StardewValley;
@@ -18,9 +19,12 @@ namespace HeadlessServer
     public class HeadlessGameServer : IGameServer
     {
         private NetServer _netServer;
-        private Dictionary<long, NetConnection> _clientConnections;
+        // Shared with the main loop, which registers and removes clients, while the day-roll
+        // worker thread performs lookups here (line 67): must be a concurrent collection so a
+        // join/timeout during the roll cannot make a roll-critical sync send miss its connection.
+        private ConcurrentDictionary<long, NetConnection> _clientConnections;
 
-        public HeadlessGameServer(NetServer netServer, Dictionary<long, NetConnection> clientConnections)
+        public HeadlessGameServer(NetServer netServer, ConcurrentDictionary<long, NetConnection> clientConnections)
         {
             _netServer = netServer;
             _clientConnections = clientConnections;

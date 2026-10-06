@@ -80,6 +80,30 @@ namespace HeadlessServer
                 Console.WriteLine($"[Shutdown] Saving farmhands failed: {ex}");
             }
 
+            // Persist the world itself before the socket closes. Day-end rolls are the only
+            // other writer, so without this a stop mid-day silently discards everything the
+            // players did since the last roll (crops, shipping, money, buildings).
+            if (headlessNewDayActive)
+            {
+                Console.WriteLine("[Shutdown] !! Skipping the world save: a day roll is half-applied, so what is in memory is not " +
+                    "a consistent world. The last completed day-end save is still on disk.");
+            }
+            else
+            {
+                try
+                {
+                    Console.WriteLine("[Shutdown] Saving the world...");
+                    if (TrySaveWorldToDisk())
+                        Console.WriteLine("[Shutdown] World saved; progress since the last day roll survives a restart.");
+                    else
+                        Console.WriteLine("[Shutdown] !! World save failed; progress since the last day roll is lost.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Shutdown] !! World save threw: {ex}");
+                }
+            }
+
             try
             {
                 // Tells every connected client why the connection is ending before the

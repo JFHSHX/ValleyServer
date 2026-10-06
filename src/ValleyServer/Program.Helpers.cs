@@ -40,9 +40,20 @@ namespace HeadlessServer
         private static readonly Dictionary<string, int> lastDebrisCountByLocation = new Dictionary<string, int>();
         private static bool updateLateErrorLogged = false;
         private static IEnumerator<int>? headlessNewDayProcess;
-        private static Thread? headlessNewDayThread;
+        // Written by the overnight worker when it finishes, read by the main loop every tick,
+        // so it must not be cached across threads.
+        private static volatile Thread? headlessNewDayThread;
         private static volatile bool headlessNewDayActive;
         private static long lastNewDayMonitorMs;
+        // Day-roll watchdog: vanilla's barrier loops wait for every farmer still in
+        // Game1.otherFarmers and only abort on a *client* timeout, so one wedged client can
+        // freeze the overnight roll (and with it the day-end world save) forever.
+        private static string lastNewDayProgressSignature = string.Empty;
+        private static long lastNewDayProgressMs;
+        private static long lastNewDayWatchdogReportMs;
+        private static bool newDayWatchdogDroppedFarmers;
+        private const int NewDayStallWarnSeconds = 15;
+        private const int NewDayStallDropSeconds = 120;
         // Vanilla drives the overnight network pump from the overnight worker. Keep the
         // headless main loop from concurrently entering the same game/network state.
 
@@ -128,8 +139,9 @@ namespace HeadlessServer
         // Server-side state is fully restored afterwards, so real clients see a pristine world.
         private static void RunDebrisSelfTest(Farm farm)
         {
-            const long testFarmerId = 88888888L;
+            long testFarmerId = SelfTestFarmerId;
             Console.WriteLine("[SelfTest] Running debris target assignment self-test...");
+            List<Debris>? realDebris = null;
             try
             {
                 var testFarmer = new Farmer(new FarmerSprite(null), Vector2.Zero, 1, "SelfTest", Farmer.initialTools(), isMale: true)
@@ -143,6 +155,11 @@ namespace HeadlessServer
                 // NetFarmerRef resolves its target through Game1.getAllFarmers(), which in
                 // 1.6.15 enumerates the world-state farmhandData directory, not otherFarmers.
                 Game1.netWorldState.Value.farmhandData[testFarmerId] = testFarmer;
+
+                // The self-test must never destroy real dropped items: the farm may hold debris
+                // restored from the world save. Snapshot the list and put it back afterwards
+                // instead of clearing it.
+                realDebris = new List<Debris>(farm.debris);
 
                 Vector2 debrisOrigin = testFarmer.Position + new Vector2(64f, 0f); // within the 128px magnetic radius
                 farm.debris.Add(new Debris("(O)388", 4, debrisOrigin, testFarmer.Position));
@@ -193,17 +210,40 @@ namespace HeadlessServer
                     }
                 }
 
-                // Restore pristine state before real clients connect.
+                // Restore pristine state before real clients connect. The test debris and the test
+                // farmer never survive, and the farm's real debris is put back untouched.
                 farm.debris.Clear();
+                foreach (Debris debris in realDebris)
+                {
+                    farm.debris.Add(debris);
+                }
                 Game1.otherFarmers.Roots.Remove(testFarmerId);
+                // farmhandData is the persistent farmhand directory the vanilla save writes, so the
+                // test farmer has to leave it too or it reappears in every later session.
+                Game1.netWorldState.Value.farmhandData.Remove(testFarmerId);
+                // The removal above queues an outgoing net change; leaving it there makes vanilla's
+                // next forced world state write (the first thing a day roll does) die with
+                // "Collection was modified" -- see DropQueuedNetDictionaryChanges.
+                int droppedChanges = DropQueuedNetDictionaryChanges(Game1.netWorldState.Value.farmhandData);
                 testFarmer.currentLocation = null;
-                Console.WriteLine("[SelfTest] Cleaned up test farmer and debris.");
+                Console.WriteLine($"[SelfTest] Cleaned up test farmer and debris ({realDebris.Count} real debris item(s) restored, phantom farmhand {testFarmerId} removed, {droppedChanges} queued net change(s) dropped).");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[SelfTest] Debris self-test crashed: {ex}");
+                // Same restore as the success path: never let the self-test delete real debris.
                 farm.debris.Clear();
+                if (realDebris != null)
+                {
+                    foreach (Debris debris in realDebris)
+                    {
+                        farm.debris.Add(debris);
+                    }
+                }
                 Game1.otherFarmers.Roots.Remove(testFarmerId);
+                Game1.netWorldState.Value.farmhandData.Remove(testFarmerId);
+                int droppedChanges = DropQueuedNetDictionaryChanges(Game1.netWorldState.Value.farmhandData);
+                Console.WriteLine($"[SelfTest] Restored {realDebris?.Count ?? 0} real debris item(s) after the crash and removed phantom farmhand {testFarmerId} ({droppedChanges} queued net change(s) dropped).");
             }
         }
 
@@ -569,7 +609,14 @@ namespace HeadlessServer
                     // bypasses; pump the native SaveGame.Save() enumerator here instead so
                     // every day roll writes a full world save to disk (the same
                     // SaveSerialization pipeline the farmhand XML files already use).
-                    TrySaveWorldToDisk();
+                    bool worldSaved = TrySaveWorldToDisk();
+                    if (!worldSaved)
+                    {
+                        // Clients are still released below so nobody hangs on the black screen,
+                        // but the day must not look persisted when it is not.
+                        Console.WriteLine("[HeadlessNewDay] !! The world save failed, so this day's progress exists only in memory. " +
+                            "Fix the cause logged above and run the 'save' command before restarting the server.");
+                    }
                     try
                     {
                         if (Game1.newDaySync != null && Game1.newDaySync.hasInstance())
@@ -648,6 +695,253 @@ namespace HeadlessServer
             };
             headlessNewDayThread.Start();
             Console.WriteLine("[HeadlessNewDay] Started vanilla overnight coroutine on background thread.");
+        }
+
+        /// <summary>
+        /// Watches an in-progress overnight roll for a farmhand that never answers its barrier.
+        /// Vanilla's NetSynchronizer.isBarrierReady waits for every farmer still present in
+        /// Game1.otherFarmers and only gives up when the *client* times out, so on a dedicated
+        /// server one crashed or wedged client freezes the roll — and the day-end world save with
+        /// it — for everybody else. Reports the blocking barrier and, after a long silence, lets
+        /// vanilla's own removal path drop the farmers that never replied. Runs on the main loop.
+        /// </summary>
+        private static void PumpHeadlessNewDayWatchdog()
+        {
+            if (!headlessNewDayActive)
+            {
+                lastNewDayProgressSignature = string.Empty;
+                newDayWatchdogDroppedFarmers = false;
+                return;
+            }
+
+            string signature = DescribeNewDayState("watchdog");
+            long now = Environment.TickCount64;
+            if (!string.Equals(signature, lastNewDayProgressSignature, StringComparison.Ordinal))
+            {
+                // Any change means the roll moved on: restart the silence timer.
+                lastNewDayProgressSignature = signature;
+                lastNewDayProgressMs = now;
+                lastNewDayWatchdogReportMs = 0;
+                newDayWatchdogDroppedFarmers = false;
+                return;
+            }
+
+            long stalledMs = now - lastNewDayProgressMs;
+            if (stalledMs < NewDayStallWarnSeconds * 1000L)
+                return;
+
+            List<long> waiting = DescribeNewDayBlocker(out string blocker);
+            if (waiting.Count == 0)
+                return;
+
+            if (now - lastNewDayWatchdogReportMs >= 15000)
+            {
+                lastNewDayWatchdogReportMs = now;
+                Console.WriteLine($"[HeadlessNewDay] !! Day roll has made no progress for {stalledMs / 1000}s; missing replies from " +
+                    $"{string.Join(", ", waiting.Select(id => $"{id} ({(clientConnections.ContainsKey(id) ? "connected" : "disconnected")})"))} at {blocker}");
+            }
+
+            if (stalledMs < NewDayStallDropSeconds * 1000L || newDayWatchdogDroppedFarmers)
+                return;
+
+            newDayWatchdogDroppedFarmers = true;
+            List<long> disconnected = waiting.Where(id => !clientConnections.ContainsKey(id)).ToList();
+            List<long> unresponsive = waiting.Where(id => clientConnections.ContainsKey(id)).ToList();
+            Console.WriteLine($"[HeadlessNewDay] !! Dropping {disconnected.Count} disconnected and {unresponsive.Count} unresponsive farmhand(s) " +
+                $"after {stalledMs / 1000}s without progress at {blocker}, so the day roll and its world save can finish.");
+            DropFarmersForSleepBarrier(disconnected.Concat(unresponsive));
+        }
+
+        /// <summary>
+        /// Names the barrier the roll is stuck on and the farmers that have not answered it.
+        /// Unreached barriers have no entry in vanilla's barrier map and answered ones contain
+        /// every online farmer, so any entry with a missing farmer is a blocker.
+        /// </summary>
+        private static List<long> DescribeNewDayBlocker(out string blocker)
+        {
+            blocker = "<unknown>";
+            var waiting = new List<long>();
+            try
+            {
+                NewDaySynchronizer? sync = Game1.newDaySync;
+                FieldInfo? barriersField = typeof(NetSynchronizer).GetField("barriers", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (sync == null || barriersField?.GetValue(sync) is not Dictionary<string, HashSet<long>> barriers)
+                {
+                    blocker = "no barrier context";
+                    return waiting;
+                }
+
+                var parts = new List<string>();
+                foreach (var entry in barriers)
+                {
+                    List<long> missing = Game1.otherFarmers.Keys.Where(id => !entry.Value.Contains(id)).ToList();
+                    if (missing.Count == 0)
+                        continue;
+                    parts.Add($"{entry.Key} (missing {string.Join("|", missing)})");
+                    foreach (long id in missing)
+                    {
+                        if (!waiting.Contains(id))
+                            waiting.Add(id);
+                    }
+                }
+                blocker = parts.Count == 0 ? "every barrier satisfied" : string.Join("; ", parts);
+            }
+            catch (Exception ex)
+            {
+                blocker = $"blocker inspection failed: {ex.Message}";
+            }
+            return waiting;
+        }
+
+        /// <summary>
+        /// Adds a farmhand to Multiplayer.disconnectingFarmers, vanilla's own path for taking a
+        /// farmhand out of the online set: the next Multiplayer.UpdateEarly() (run by the day roll's
+        /// message pump, or by the main loop when no roll is running) calls
+        /// removeDisconnectedFarmers(), which removes it from Game1.otherFarmers on the thread that
+        /// owns the update loop. Mutating Game1.otherFarmers directly from another thread would race
+        /// the roll worker, which iterates that dictionary inside NetSynchronizer.barrierReady.
+        /// Returns true when the farmhand is (now) marked for removal.
+        /// </summary>
+        internal static bool MarkFarmhandAsDisconnecting(long farmerId)
+        {
+            try
+            {
+                var mp = typeof(Game1).GetField("multiplayer", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(null) as Multiplayer;
+                FieldInfo? field = typeof(Multiplayer).GetField("disconnectingFarmers", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (mp == null || field?.GetValue(mp) is not List<long> disconnecting)
+                {
+                    Console.WriteLine("[HeadlessNewDay] !! Could not reach multiplayer.disconnectingFarmers; the farmhand cannot be removed safely.");
+                    return false;
+                }
+                if (!disconnecting.Contains(farmerId))
+                {
+                    disconnecting.Add(farmerId);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HeadlessNewDay] !! Marking farmhand {farmerId} as disconnecting failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Drops farmhands that are blocking the overnight barrier through vanilla's own removal
+        /// path (see MarkFarmhandAsDisconnecting): the roll's message pump applies it within ~16ms,
+        /// between its barrier checks, so it cannot race the worker's iteration of otherFarmers.
+        /// </summary>
+        private static void DropFarmersForSleepBarrier(IEnumerable<long> farmerIds)
+        {
+            int marked = 0;
+            foreach (long id in farmerIds)
+            {
+                if (MarkFarmhandAsDisconnecting(id))
+                {
+                    marked++;
+                }
+            }
+            Console.WriteLine($"[HeadlessNewDay] Marked {marked} unreachable farmhand(s) as disconnecting; the roll's own message pump " +
+                "applies the removal, so the next barrier check should pass.");
+        }
+
+        /// <summary>
+        /// Drops the outbound netcode changes queued on a NetDictionary (for example
+        /// NetWorldState.farmhandData). Adding or removing an entry queues a change in the dictionary's
+        /// private outgoingChanges list, and vanilla's write path enumerates that list while a
+        /// re-entrant clean can clear it: the day roll then dies with "Collection was modified;
+        /// enumeration operation may not execute" while writing NetWorldState field 'farmhandData'.
+        /// Only call this at startup, before any client can have received the queued entries: the
+        /// dictionary contents are untouched, so a client still gets the full state when it joins.
+        /// </summary>
+        internal static int DropQueuedNetDictionaryChanges(object netDictionary)
+        {
+            // GetField() only sees members declared on the type itself, so the private
+            // outgoingChanges field of a generic base (NetDictionary`5) has to be looked up
+            // by walking the base type chain by hand.
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            for (Type? type = netDictionary.GetType(); type != null; type = type.BaseType)
+            {
+                FieldInfo? field = type.GetField("outgoingChanges", flags);
+                if (field?.GetValue(netDictionary) is System.Collections.IList changes)
+                {
+                    int dropped = changes.Count;
+                    changes.Clear();
+                    return dropped;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// True when a client may activate this farmhand id. Reserved ids, the host's own id and ids
+        /// that another live connection already owns are rejected: accepting them let a client evict
+        /// the earlier player's mapping (whose disconnect then cleaned up nothing) while both
+        /// connections kept writing deltas for the same farmhand. A stale mapping (connection no
+        /// longer Connected) is allowed to be taken over.
+        /// </summary>
+        internal static bool IsClientFarmhandIdAcceptable(long farmhandId, NetConnection sender)
+        {
+            if (farmhandId == 0L || farmhandId == 99999999L || farmhandId == SelfTestFarmerId || farmhandId == Game1.player?.UniqueMultiplayerID)
+            {
+                return false;
+            }
+            if (clientConnections.TryGetValue(farmhandId, out NetConnection? existing)
+                && existing != sender
+                && existing.Status == NetConnectionStatus.Connected)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Registers farmhands whose handshake completed while a day roll was running. The roll's
+        /// worker thread iterates Game1.otherFarmers inside NetSynchronizer.barrierReady, so the main
+        /// loop applies the deferred roots only once no roll is active.
+        /// </summary>
+        private static void PumpPendingFarmhandRegistrations()
+        {
+            if (pendingFarmhandRegistrations.Count == 0)
+            {
+                return;
+            }
+
+            foreach (long id in pendingFarmhandRegistrations)
+            {
+                if (!pendingFarmhandRoots.TryGetValue(id, out NetFarmerRoot? root))
+                {
+                    continue;
+                }
+                if (!clientConnections.ContainsKey(id))
+                {
+                    Console.WriteLine($"[Protocol] Dropping the deferred online registration of farmhand {id}: its connection is gone.");
+                    continue;
+                }
+                Game1.otherFarmers.Roots[id] = root;
+                Console.WriteLine($"[Protocol] Deferred online registration of farmhand {id} applied after the day roll finished.");
+            }
+
+            pendingFarmhandRegistrations.Clear();
+            pendingFarmhandRoots.Clear();
+        }
+
+        /// <summary>
+        /// Discards overnight sync messages that arrived after the roll's last pump. Their
+        /// generation is over: replaying them into the next roll would mix a finished day's
+        /// ready/finish replies into the next day's barriers.
+        /// </summary>
+        private static void DropStaleDeferredOvernightMessages()
+        {
+            int dropped = 0;
+            while (deferredOvernightMessages.TryDequeue(out _))
+            {
+                dropped++;
+            }
+            if (dropped > 0)
+            {
+                Console.WriteLine($"[Protocol] Dropped {dropped} deferred overnight sync message(s) left over from the finished day roll.");
+            }
         }
 
         /// <summary>
@@ -1302,7 +1596,8 @@ namespace HeadlessServer
         /// SaveGameMenu the host bypasses; pumping it after the overnight coroutine makes
         /// world progress (day, farm objects, crops, world state) survive a restart.
         /// </summary>
-        private static void TrySaveWorldToDisk()
+        /// <returns>True when the enumerator completed, false when it threw (already logged loudly).</returns>
+        private static bool TrySaveWorldToDisk()
         {
             try
             {
@@ -1319,11 +1614,55 @@ namespace HeadlessServer
                 {
                     steps++;
                 }
-                Console.WriteLine($"[HeadlessSave] World save enumerator finished ({steps} steps), slot={Game1.player?.slotName}.");
+                // Game1.player.slotName stays empty on the load path (the enumerator derives the
+                // folder from the farm name and unique id itself), so report the slot that was
+                // actually written instead of the field.
+                Console.WriteLine($"[HeadlessSave] World save enumerator finished ({steps} steps): day={Game1.dayOfMonth} " +
+                    $"time={Game1.timeOfDay} slot={NewestSlotDescription()}");
+                return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[HeadlessSave] World save failed: {ex}");
+                Console.WriteLine($"[HeadlessSave] !! World save FAILED: day {Game1.dayOfMonth} at {Game1.timeOfDay} is still " +
+                    $"only in memory and will be lost on restart: {ex}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Operator-facing world save behind the <c>save</c> command: refuses while a day roll is
+        /// half-applied, because what is in memory then is not a consistent world.
+        /// </summary>
+        internal static void ForceWorldSave()
+        {
+            if (headlessNewDayActive || Game1.newDay)
+            {
+                Console.WriteLine("[HeadlessSave] A day roll is in progress, so the world is half-applied; try again once it finishes.");
+                return;
+            }
+            Console.WriteLine("[HeadlessSave] Saving the world on request...");
+            if (TrySaveWorldToDisk())
+                Console.WriteLine("[HeadlessSave] World saved on request.");
+        }
+
+        /// <summary>
+        /// Names the slot folder written most recently, for save log lines. The enumerator
+        /// derives that folder from the farm name plus unique id and never fills in
+        /// Game1.player.slotName on the load path, so reading the field back is misleading.
+        /// </summary>
+        private static string NewestSlotDescription()
+        {
+            try
+            {
+                DirectoryInfo? newest = new DirectoryInfo(StardewValley.Program.GetSavesFolder())
+                    .GetDirectories()
+                    .OrderByDescending(d => d.LastWriteTime)
+                    .FirstOrDefault();
+                return newest == null ? "<none>" : $"{newest.Name} ({newest.LastWriteTime:yyyy-MM-dd HH:mm:ss})";
+            }
+            catch (Exception ex)
+            {
+                return $"<unavailable: {ex.Message}>";
             }
         }
 

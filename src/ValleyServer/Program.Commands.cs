@@ -27,9 +27,15 @@ namespace HeadlessServer
             commandRegistry.Register(new ServerCommand(
                 name: "stop",
                 usage: "stop",
-                description: "Save every farmhand, disconnect clients and exit.",
+                description: "Save the world and every farmhand, disconnect clients and exit.",
                 handler: _ => RequestGracefulShutdown("the stop command"),
                 aliases: new[] { "shutdown", "quit" }));
+
+            commandRegistry.Register(new ServerCommand(
+                name: "save",
+                usage: "save",
+                description: "Write the world to its save slot now, so progress survives a restart without rolling the day.",
+                handler: _ => ForceWorldSave()));
 
             RegisterDiagnosticCommands();
         }
