@@ -104,11 +104,21 @@ namespace HeadlessServer
                         commandFilePosition = 0;
                     return;
                 }
-                using var stream = new FileStream(commandFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                stream.Seek(commandFilePosition, SeekOrigin.Begin);
-                using var reader = new StreamReader(stream);
-                string? line;
-                while ((line = reader.ReadLine()) != null)
+
+                var lines = new List<string>();
+                long consumedTo;
+                using (var stream = new FileStream(commandFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    stream.Seek(commandFilePosition, SeekOrigin.Begin);
+                    using var reader = new StreamReader(stream);
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
+                        lines.Add(line);
+                    consumedTo = stream.Position;
+                }
+                commandFilePosition = consumedTo;
+
+                foreach (string line in lines)
                 {
                     string trimmed = line.Trim();
                     if (trimmed.Length == 0)
@@ -132,7 +142,16 @@ namespace HeadlessServer
                         Console.WriteLine($"[Commands] '{command.Name}' failed: {ex}");
                     }
                 }
-                commandFilePosition = stream.Position;
+
+                // Commands are one-shot. Clear what this pass consumed so a stale line (for
+                // example a 'roll' left in the file by an earlier run) cannot fire again and
+                // roll the day straight after a restart. Lines appended while this pass ran
+                // are kept and picked up next pass.
+                if (new FileInfo(commandFilePath).Length <= consumedTo)
+                {
+                    File.WriteAllText(commandFilePath, string.Empty);
+                    commandFilePosition = 0;
+                }
             }
             catch (Exception ex)
             {

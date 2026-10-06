@@ -281,13 +281,28 @@ namespace HeadlessServer
             // Create uninitialized Game1 instance to bypass constructor & XNA graphics context checks
             var gameInstance = (Game1)FormatterServices.GetUninitializedObject(typeof(Game1));
             Game1.game1 = gameInstance;
-            // Options() touches GameRunner.instance through its dirty-state setters. The
-            // server only needs networking policy fields, so initialize it without the
-            // graphics-bound constructor and set those fields explicitly.
-            Game1.options = (Options)FormatterServices.GetUninitializedObject(typeof(Options));
-            // Farmer.resetState() clears a mount during the overnight save phase and
-            // recalculates running from options.runButton. The graphics-free Options object
-            // has no constructor, so initialize the input array that path dereferences.
+            // Options() reads display modes through Game1.graphics and touches
+            // GameRunner.instance through its dirty-state setters, so install the inert
+            // display chain first and prefer a fully constructed instance: its field
+            // initializers fill every input-button array (chatButton, runButton, ...) that
+            // Game1.GetKeyboardState dereferences during the load pipeline and the overnight
+            // new-day pass. A graphics-free fallback keeps the server bootable if the
+            // constructor still refuses to run.
+            EnsureHeadlessGraphics();
+            Options? headlessOptions = null;
+            try
+            {
+                headlessOptions = new Options();
+            }
+            catch (Exception optionsEx)
+            {
+                Console.WriteLine($"Options() construction failed; falling back to a graphics-free instance: {optionsEx.Message}");
+            }
+            headlessOptions ??= (Options)FormatterServices.GetUninitializedObject(typeof(Options));
+            // No input-button array may stay null: isOneOfTheseKeysDown iterates them and
+            // throws on a null array (the fallback instance runs no field initializers).
+            SeedEmptyArrays(headlessOptions);
+            Game1.options = headlessOptions;
             Game1.options.runButton = new[] { new InputButton(Keys.LeftShift) };
             Game1.options.ipConnectionsEnabled = true;
             Game1.options.enableFarmhandCreation = true;
@@ -393,6 +408,67 @@ namespace HeadlessServer
                 CraftingRecipe.cookingRecipes ??= new Dictionary<string, string>();
             }
 
+            // Save deserialization fires Farmer netfield change callbacks whose guards
+            // query Farmer.IsLocalPlayer; that getter dereferences Game1.player, which is
+            // null until the loaded farmer is assigned. Provide a throwaway farmer with a
+            // unique id that never matches a saved farmer so every guard resolves to
+            // false; the load pipeline replaces Game1.player with the loaded host.
+            var deserializeProbeFarmer = new Farmer();
+            deserializeProbeFarmer.UniqueMultiplayerID = 1L;
+            gamePlayerField.SetValue(null, deserializeProbeFarmer);
+
+            // Restore a persisted world when a previous day roll wrote one; only build a
+            // fresh world when there is nothing to restore. The vanilla load pipeline
+            // rebuilds the host farmer, farmhands, every location, and world state exactly
+            // as the retail game's "continue" flow does. Multiplayer mode must stay 0
+            // (single-player) through the load: save deserialization fires Farmer netfield
+            // callbacks that dereference Game1.player (null until the loaded farmer is
+            // assigned) whenever Game1.IsMultiplayer is true. Both paths below switch to
+            // multiplayerServer before the server starts listening.
+            bool worldLoaded = TryLoadWorldFromDisk();
+
+            if (!worldLoaded && WorldLoadBlockedByUnreadableSlot)
+            {
+                // Never trade the player's world for a running server. The slot is still on disk,
+                // unreadable and untouched; HandleUnreadableSlot lists the operator's options.
+                // Exiting non-zero keeps supervisors from mistaking this for a healthy server.
+                Console.WriteLine($"[HeadlessSave] Startup aborted: slot '{BlockedSlotName}' exists but could not be read.");
+                Environment.Exit(1);
+            }
+
+            if (worldLoaded)
+            {
+                // Switch to the authoritative-server mode only after the load pipeline
+                // finished (see the deserialization note above), mirroring the fresh path.
+                Game1.multiplayerMode = Game1.multiplayerServer;
+                Game1.setGameMode(Game1.playingGameMode);
+                Game1.netWorldState.Value.UpdateFromGame1();
+                // Wrap the loaded host farmer in the same network roots the fresh path
+                // builds; the load pipeline only assigns Game1.player/currentLocation.
+                Game1.serverHost = new NetFarmerRoot(Game1.player);
+                Game1.otherFarmers = new NetRootDictionary<long, Farmer>();
+                Game1.otherFarmers.Serializer = SaveSerializer.GetSerializer(typeof(Farmer));
+                foreach (var restored in Game1.locations)
+                    multiplayer?.locationRoot(restored);
+                Game1.currentLocation = Game1.player?.currentLocation ?? Game1.getFarm();
+                if (Game1.player?.currentLocation != null)
+                    Game1.player.currentLocation = Game1.player.currentLocation;
+                // The character-selection catalog is loaded from XML below; also include
+                // the farmhands restored from the world save so returning players see
+                // every farmer that ever existed in this world.
+                foreach (long key in Game1.netWorldState.Value.farmhandData.Keys)
+                {
+                    var restoredFarmhand = Game1.netWorldState.Value.farmhandData[key];
+                    if (key != 99999999L && restoredFarmhand != null)
+                    {
+                        savedFarmhandCatalog[key] = restoredFarmhand;
+                        savedFarmerIds.Add(key);
+                    }
+                }
+                Console.WriteLine($"[World] Restored world: day={Game1.dayOfMonth} year={Game1.year} season={Game1.season} host={Game1.player?.Name}");
+            }
+            else
+            {
             // Create host player
             var host = new Farmer();
             host.Name = worldConfig.HostName;
@@ -490,12 +566,13 @@ namespace HeadlessServer
             Game1.gameTimeInterval = 0;
             Game1.netWorldState.Value.UpdateFromGame1();
             EnsureFarmhandHomesAndBeds(farm);
+            }
 
             // Load saved farmhands from disk on startup
             LoadSavedFarmhands();
             // Loading the building definitions creates the cabin interior and its starter bed.
             // Do this after the farm is registered, since Cabin's constructor queries Game1.getFarm().
-            EnsureFarmhandHomesAndBeds(farm);
+            EnsureFarmhandHomesAndBeds(Game1.getFarm());
 
             // The location update path queries the music system (getMusicTrackName via
             // isMusicContextActiveButNotPlaying). Its backing dictionary is an instance
@@ -512,48 +589,22 @@ namespace HeadlessServer
                 Console.WriteLine("Mocked Game1._instanceRequestedMusicTracks for headless music queries.");
             }
 
-            // BuffManager.GetValues marks the HUD buff display dirty for the locally
-            // controlled farmer. Debris target selection reads each farmer's magnetic
-            // radius through that path, so the host farmer's recalculation must not NRE
-            // on the missing UI component. Provide an inert instance (no constructors run,
-            // so nothing subscribes to game events).
-            if (Game1.buffsDisplay == null)
-            {
-                Game1.buffsDisplay = (StardewValley.Menus.BuffsDisplay)FormatterServices.GetUninitializedObject(typeof(StardewValley.Menus.BuffsDisplay));
-                Console.WriteLine("Mocked Game1.buffsDisplay for headless buff recalculation.");
-            }
-
             // Game1.NewDay() writes nonWarpFade / fadeToBlackAlpha and FadeScreenToBlack
-            // through this private ScreenFade instance, which the real Game1 constructor
-            // creates. Headless mode skips that constructor, so NewDay() threw a null
-            // reference part-way through (after newDay was already set), which then broke
-            // the overnight coroutine's barrier pumping. A real ScreenFade with inert
-            // callbacks is safe: its state is plain fields and its callbacks are never
-            // invoked because headless never runs UpdateFade.
-            FieldInfo? screenFadeField = typeof(Game1).GetField("screenFade", BindingFlags.Static | BindingFlags.NonPublic);
-            if (screenFadeField != null && screenFadeField.GetValue(null) == null)
-            {
-                screenFadeField.SetValue(null, new StardewValley.BellsAndWhistles.ScreenFade(() => false, () => { }));
-                Console.WriteLine("Mocked Game1.screenFade for headless NewDay/fade writes.");
-            }
+            // through a private ScreenFade instance, and Game1.loadForNewGame writes
+            // nonWarpFade on its very first statements; Game1.buffsDisplay is dereferenced
+            // when a farmer's buffs are recalculated. The real Game1 constructor creates
+            // all of them, which headless mode skips, so they are installed here (and, for
+            // the load path, inside the load pipeline before any vanilla code runs).
+            EnsureHeadlessCommonStatics();
 
             // LocalMultiplayer.IsLocalMultiplayer() (called from NetSynchronizer.barrier
-            // while the overnight coroutine waits for farmhands) dereferences
+            // while the overnight coroutine waits for farmhands, and from getLoadEnumerator
+            // when choosing how to apply locations) dereferences
             // GameRunner.instance.gameInstances. A headless host never constructs the
             // XNA GameRunner, so give it an inert instance with an empty gameInstances
             // list: IsLocalMultiplayer then safely returns false, which is the desired
             // "remote multiplayer, keep waiting at the barrier" behavior.
-            if (GameRunner.instance == null)
-            {
-                var gameRunner = (GameRunner)FormatterServices.GetUninitializedObject(typeof(GameRunner));
-                var gameInstancesField = typeof(GameRunner).GetField("gameInstances", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (gameInstancesField != null)
-                {
-                    gameInstancesField.SetValue(gameRunner, new List<Game1>());
-                }
-                GameRunner.instance = gameRunner;
-                Console.WriteLine("Mocked GameRunner.instance for headless LocalMultiplayer checks.");
-            }
+            EnsureHeadlessGameRunner();
 
             // Multiplayer.allowSyncDelay() calls Game1.newDaySync.hasInstance() on every
             // UpdateEarly/UpdateLate; a null synchronizer made both throw inside the tick's
@@ -624,7 +675,7 @@ namespace HeadlessServer
             // Validate the server-side half of the vanilla pickup chain before accepting
             // clients: target assignment must work for an inhabited location, or a real
             // client could never receive Debris.player and pick anything up.
-            RunDebrisSelfTest(farm);
+            RunDebrisSelfTest(Game1.getFarm());
 
             // 5. Message loop. Ctrl+C/console shutdown stops accepting work cleanly.
             RegisterBuiltInCommands();

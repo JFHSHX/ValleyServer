@@ -75,6 +75,15 @@ namespace HeadlessServer
             /// <summary>Upper bound of simultaneously selectable farmhands.</summary>
             public int MaxFarmhands { get; set; } = 4;
 
+            /// <summary>
+            /// The save slot this server should restore exists but cannot be read. By default
+            /// the server refuses to start instead of building a fresh world, because the
+            /// fresh world keeps the slot's farm name/unique id and its next day-end save
+            /// overwrites the player's progress. Set this to true to start anyway; the
+            /// unreadable slot is then renamed aside first (never deleted).
+            /// </summary>
+            public bool StartFreshWhenSaveUnreadable { get; set; } = false;
+
             /// <summary>Parsnip seeds handed to a newly created farmhand.</summary>
             public int StarterParsnipSeeds { get; set; } = 15;
         }
@@ -103,6 +112,14 @@ namespace HeadlessServer
             /// against the executable directory.
             /// </summary>
             public string SaveDirectory { get; set; } = "saved_farmhands";
+
+            /// <summary>
+            /// Name of the vanilla save slot folder (inside the game's Saves folder) to
+            /// restore the world from on startup, e.g. <c>HeadlessFarm_63926782547</c>.
+            /// Empty auto-detects the newest slot for the configured farm name; no slot
+            /// found falls back to creating a fresh world.
+            /// </summary>
+            public string SaveSlotName { get; set; } = "";
         }
     }
 }

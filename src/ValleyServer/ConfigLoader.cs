@@ -168,6 +168,7 @@ namespace HeadlessServer
             config.World.HostName = config.World.HostName?.Trim() ?? "";
             config.Paths.ContentPath = config.Paths.ContentPath?.Trim() ?? "";
             config.Paths.SaveDirectory = config.Paths.SaveDirectory?.Trim() ?? "";
+            config.Paths.SaveSlotName = config.Paths.SaveSlotName?.Trim() ?? "";
         }
 
         private static void Validate(ServerConfig config)
@@ -246,9 +247,10 @@ namespace HeadlessServer
                               $"Network.MaximumTransmissionUnit={network.MaximumTransmissionUnit}");
             Console.WriteLine($"[Config]   World.FarmType={world.FarmType} World.FarmName={world.FarmName} World.HostName={world.HostName} " +
                               $"World.Seed={world.Seed} World.StartingCabins={world.StartingCabins} World.CabinsSeparate={world.CabinsSeparate} " +
-                              $"World.MaxFarmhands={world.MaxFarmhands} World.StarterParsnipSeeds={world.StarterParsnipSeeds}");
+                              $"World.MaxFarmhands={world.MaxFarmhands} World.StarterParsnipSeeds={world.StarterParsnipSeeds} " +
+                              $"World.StartFreshWhenSaveUnreadable={world.StartFreshWhenSaveUnreadable}");
             Console.WriteLine($"[Config]   Simulation.MillisecondsPerTenMinutes={config.Simulation.MillisecondsPerTenMinutes}");
-            Console.WriteLine($"[Config]   Paths.ContentPath={contentPath} Paths.SaveDirectory={config.Paths.SaveDirectory}");
+            Console.WriteLine($"[Config]   Paths.ContentPath={contentPath} Paths.SaveDirectory={config.Paths.SaveDirectory} Paths.SaveSlotName={config.Paths.SaveSlotName}");
         }
     }
 }

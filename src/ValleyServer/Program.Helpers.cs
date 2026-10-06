@@ -4,12 +4,15 @@ using System;
 using System.Collections;
 using System.IO;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.Serialization;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using xTile.Dimensions;
 using xTile.Display;
@@ -562,6 +565,11 @@ namespace HeadlessServer
                     // On dedicated/headless server, SaveGameMenu UI is bypassed, so ensure
                     // save synchronization flags and finish signals are sent to client farmhands.
                     Console.WriteLine(DescribeNewDayState("coroutine-returned"));
+                    // Vanilla persists the whole world during the SaveGameMenu that this host
+                    // bypasses; pump the native SaveGame.Save() enumerator here instead so
+                    // every day roll writes a full world save to disk (the same
+                    // SaveSerialization pipeline the farmhand XML files already use).
+                    TrySaveWorldToDisk();
                     try
                     {
                         if (Game1.newDaySync != null && Game1.newDaySync.hasInstance())
@@ -640,6 +648,683 @@ namespace HeadlessServer
             };
             headlessNewDayThread.Start();
             Console.WriteLine("[HeadlessNewDay] Started vanilla overnight coroutine on background thread.");
+        }
+
+        /// <summary>
+        /// Creates the inert GameRunner singleton the headless host needs: an uninitialized
+        /// instance holding an empty gameInstances list (LocalMultiplayer.IsLocalMultiplayer
+        /// dereferences it) and a window shell (Options' ctor detaches its resize handler).
+        /// Idempotent; both the startup mock block and the load pipeline call it.
+        /// </summary>
+        internal static void EnsureHeadlessGameRunner()
+        {
+            if (GameRunner.instance != null)
+                return;
+            var runnerMock = (GameRunner)FormatterServices.GetUninitializedObject(typeof(GameRunner));
+            typeof(GameRunner).GetField("gameInstances", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.SetValue(runnerMock, new List<Game1>());
+            // GamePlatform/GameWindow are abstract (and internal) in MonoGame; the DesktopGL
+            // build implements them as SdlGamePlatform/SdlGameWindow. Only inert shells are
+            // needed: OnWindowSizeChange's base.Window.ClientSizeChanged -= handler is a
+            // no-op on an uninitialized window whose event delegate is still null.
+            Type platformType = typeof(Game).Assembly.GetType("Microsoft.Xna.Framework.GamePlatform")!;
+            Type windowType = typeof(Game).Assembly.GetType("Microsoft.Xna.Framework.GameWindow")!;
+            object platformMock = FormatterServices.GetUninitializedObject(FindConcreteShell(platformType));
+            platformType.GetField("_window", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(platformMock, FormatterServices.GetUninitializedObject(FindConcreteShell(windowType)));
+            typeof(Game).GetField("Platform", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+                ?.SetValue(runnerMock, platformMock);
+            GameRunner.instance = runnerMock;
+            Console.WriteLine("Mocked GameRunner.instance (empty gameInstances + window shell) for headless mode.");
+        }
+
+        /// <summary>
+        /// Installs the inert statics that the vanilla Game1 constructor would have created.
+        /// Headless mode bypasses that constructor, and both the save and the load pipeline
+        /// run vanilla code that dereferences them, so every entry point has to install them
+        /// before pumping vanilla enumerators. Idempotent: existing values are left alone.
+        /// </summary>
+        internal static void EnsureHeadlessCommonStatics()
+        {
+            EnsureHeadlessGameRunner();
+
+            // Game1.nonWarpFade / fadeToBlack / globalFade all forward to this private
+            // ScreenFade instance; a null one made Game1.loadForNewGame throw an NRE on its
+            // very first statements (and Game1.NewDay threw later, after newDay was set).
+            // Its state is plain fields and its callbacks are never invoked because headless
+            // never runs UpdateFade, so a real instance with inert callbacks is safe.
+            FieldInfo? screenFadeField = typeof(Game1).GetField("screenFade", BindingFlags.Static | BindingFlags.NonPublic);
+            if (screenFadeField != null && screenFadeField.GetValue(null) == null)
+            {
+                screenFadeField.SetValue(null, new StardewValley.BellsAndWhistles.ScreenFade(() => false, () => { }));
+                Console.WriteLine("Mocked Game1.screenFade for headless fade writes.");
+            }
+
+            // Game1.loadForNewGame constructs the ChatBox, whose constructor assigns
+            // KeyboardDispatcher.Subscriber. The dispatcher lives in
+            // game1.instanceKeyboardDispatcher (null here), so that assignment threw an NRE
+            // and aborted the whole load. On Windows the real constructor only subscribes to
+            // window.TextInput, which is inert for the headless window shell because nothing
+            // ever pumps input events.
+            if (Game1.keyboardDispatcher == null)
+            {
+                GameWindow? windowShell = GameRunner.instance?.Window;
+                if (windowShell == null)
+                {
+                    Console.WriteLine("Cannot mock Game1.keyboardDispatcher: no window shell available.");
+                }
+                else
+                {
+                    Game1.keyboardDispatcher = new KeyboardDispatcher(windowShell);
+                    Console.WriteLine("Mocked Game1.keyboardDispatcher for headless UI construction.");
+                }
+            }
+
+            // Game1 now derives from InstanceGame, so every GraphicsDevice/Content/Components
+            // lookup forwards to GameRunner.instance. The uninitialized runner holds no
+            // graphics device service, which made Game.get_GraphicsDevice throw inside the
+            // load pipeline. GraphicsDeviceManager implements IGraphicsDeviceService, so the
+            // display chain mocked for Options also satisfies runner device queries.
+            if (Game1.graphics != null)
+            {
+                FieldInfo? serviceField = typeof(Game)
+                    .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(field => typeof(IGraphicsDeviceService).IsAssignableFrom(field.FieldType));
+                if (serviceField != null && serviceField.GetValue(GameRunner.instance) == null)
+                {
+                    serviceField.SetValue(GameRunner.instance, Game1.graphics);
+                    Console.WriteLine("Wired GameRunner graphics device service for headless GraphicsDevice queries.");
+                }
+            }
+
+            // BuffManager.GetValues marks the HUD buff display dirty for the locally
+            // controlled farmer. Debris target selection reads each farmer's magnetic
+            // radius through that path, so the host farmer's recalculation must not NRE
+            // on the missing UI component. Provide an inert instance (no constructors run,
+            // so nothing subscribes to game events).
+            if (Game1.buffsDisplay == null)
+            {
+                Game1.buffsDisplay = (StardewValley.Menus.BuffsDisplay)FormatterServices.GetUninitializedObject(typeof(StardewValley.Menus.BuffsDisplay));
+                Console.WriteLine("Mocked Game1.buffsDisplay for headless buff recalculation.");
+            }
+
+            // getLoadEnumerator dereferences Game1.dayTimeMoneyBox at its very end; the
+            // real Game1 constructor creates it, this headless instance does not.
+            // Provide an inert instance (no constructors run) so the pipeline completes.
+            FieldInfo? dayTimeMoneyBoxField = typeof(Game1).GetField("dayTimeMoneyBox",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (dayTimeMoneyBoxField != null && dayTimeMoneyBoxField.GetValue(null) == null)
+            {
+                dayTimeMoneyBoxField.SetValue(null, FormatterServices.GetUninitializedObject(typeof(StardewValley.Menus.DayTimeMoneyBox)));
+                Console.WriteLine("Mocked Game1.dayTimeMoneyBox for headless load pipeline.");
+            }
+
+            // The headless server runs no audio device. Vanilla's Game1.Initialize falls
+            // back to the game's own no-op audio stack when XACT cannot start, and gameplay
+            // code calls these unconditionally (initializeVolumeLevels during the load
+            // pipeline, playSound during festivals and tool use). Mirror that fallback so
+            // every audio call is inert instead of null-dereferencing.
+            if (Game1.audioEngine == null)
+            {
+                Type dummyAudioEngineType = typeof(Game1).Assembly.GetType("StardewValley.Audio.DummyAudioEngine")!;
+                Game1.audioEngine = (StardewValley.Audio.IAudioEngine)Activator.CreateInstance(dummyAudioEngineType)!;
+                Game1.soundBank = new DummySoundBank();
+                Game1.audioEngine.Update();
+                Game1.musicCategory = Game1.audioEngine.GetCategory("Music");
+                Game1.soundCategory = Game1.audioEngine.GetCategory("Sound");
+                Game1.ambientCategory = Game1.audioEngine.GetCategory("Ambient");
+                Game1.footstepCategory = Game1.audioEngine.GetCategory("Footsteps");
+                Game1.wind = Game1.soundBank.GetCue("wind");
+                Game1.chargeUpSound = Game1.soundBank.GetCue("toolCharge");
+                Console.WriteLine("Installed the no-op audio stack (DummyAudioEngine/DummySoundBank) for headless sound calls.");
+            }
+
+            // FarmerRenderer's textures normally come from Game1.LoadContent. A null
+            // hairStylesTexture NREs while the load pipeline restores the host farmer
+            // (Farmer.changeHairStyle -> GetLastHairStyle -> GetAllHairstyleIndices reads
+            // hairStylesTexture.Height). The headless content manager hands out inert
+            // 1280x1280 textures for any Texture2D request, which satisfies that math and
+            // every other dimension lookup without touching the GPU.
+            if (FarmerRenderer.hairStylesTexture == null)
+            {
+                FarmerRenderer.hairStylesTexture = Game1.content.Load<Texture2D>("Characters\\Farmer\\hairstyles");
+                FarmerRenderer.shirtsTexture = Game1.content.Load<Texture2D>("Characters\\Farmer\\shirts");
+                FarmerRenderer.hatsTexture = Game1.content.Load<Texture2D>("Characters\\Farmer\\hats");
+                FarmerRenderer.accessoriesTexture = Game1.content.Load<Texture2D>("Characters\\Farmer\\accessories");
+                FarmerRenderer.pantsTexture = Game1.content.Load<Texture2D>("Characters\\Farmer\\pants");
+                Console.WriteLine("Loaded inert FarmerRenderer textures for headless hairstyle and clothing lookups.");
+            }
+
+            // Vanilla's Game1 constructor creates several collections that its own code
+            // dereferences unconditionally (loadForNewGame ends with
+            // newGameSetupOptions.Clear(), the debris pass walks _farmerShadows). The
+            // headless instance runs no constructor, so every null collection field would
+            // throw. Seed empty instances to match vanilla's post-constructor state.
+            if (Game1.game1 != null)
+                SeedEmptyCollections(Game1.game1);
+
+            // Game1.Initialize creates the online-player dictionary, and Game1.GetPlayer
+            // dereferences it unconditionally. The load pipeline reaches GetPlayer while it
+            // replays queued team events (FarmerTeam.OnBuildingConstructedEvent ->
+            // Building.performActionOnConstruction -> Cabin.CreateFarmhand), so a null
+            // dictionary aborted the whole load. Restoring a world only needs it to exist:
+            // farmhands live in netWorldState.farmhandData, and vanilla replaces this
+            // instance as clients connect.
+            if (Game1.otherFarmers == null)
+            {
+                Game1.otherFarmers = new NetRootDictionary<long, Farmer>();
+                Game1.otherFarmers.Serializer = SaveSerializer.GetSerializer(typeof(Farmer));
+                Console.WriteLine("Created Game1.otherFarmers for headless load pipeline.");
+            }
+        }
+
+        /// <summary>
+        /// Replaces every null array field of an inert mock with an empty array. Framework
+        /// types (MonoGame's GraphicsDevice) copy their backing arrays into result arrays
+        /// even when empty, which throws ArgumentNullException on uninitialized instances.
+        /// </summary>
+        private static void SeedEmptyArrays(object instance)
+        {
+            foreach (FieldInfo field in instance.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (!field.FieldType.IsArray || field.GetValue(instance) != null)
+                    continue;
+                Type? elementType = field.FieldType.GetElementType();
+                if (elementType == null)
+                    continue;
+                try
+                {
+                    field.SetValue(instance, Array.CreateInstance(elementType, 0));
+                }
+                catch
+                {
+                    // Best effort: fields that reject the value are left as they were.
+                }
+            }
+        }
+
+        /// <summary>
+        /// Replaces every null List/Dictionary/HashSet field of a headless mock with an empty
+        /// instance, matching the state vanilla reaches by running the real constructors
+        /// (which those code paths then dereference without a null check). Best effort.
+        /// </summary>
+        private static void SeedEmptyCollections(object instance)
+        {
+            foreach (FieldInfo field in instance.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (field.GetValue(instance) != null)
+                    continue;
+                Type type = field.FieldType;
+                if (!type.IsClass || type.IsAbstract || !type.IsGenericType)
+                    continue;
+                Type definition = type.GetGenericTypeDefinition();
+                if (definition != typeof(List<>) && definition != typeof(Dictionary<,>) && definition != typeof(HashSet<>))
+                    continue;
+                try
+                {
+                    field.SetValue(instance, Activator.CreateInstance(type));
+                }
+                catch
+                {
+                    // Best effort: fields that reject the value are left as they were.
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns <paramref name="type"/> itself when it can be instantiated without a
+        /// constructor, otherwise the first concrete subclass. MonoGame's abstract
+        /// GamePlatform/GameWindow are implemented by the internal Sdl* types, which
+        /// <see cref="FormatterServices.GetUninitializedObject(Type)"/> accepts (it
+        /// refuses abstract types).
+        /// </summary>
+        private static Type FindConcreteShell(Type type)
+        {
+            if (!type.IsAbstract)
+                return type;
+            try
+            {
+                return type.Assembly.GetTypes().FirstOrDefault(t => !t.IsAbstract && type.IsAssignableFrom(t)) ?? type;
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                return ex.Types.Where(t => t != null).FirstOrDefault(t => !t!.IsAbstract && type.IsAssignableFrom(t!)) ?? type;
+            }
+        }
+
+        /// <summary>
+        /// Installs the inert MonoGame display chain that headless Options construction and
+        /// every GraphicsDevice query forwards to: platform/window shells, a one-entry
+        /// display-mode list, a graphics device and its device manager. No native resources
+        /// are created. Idempotent, so callers may install it before any vanilla code that
+        /// reads options or graphics state.
+        /// </summary>
+        internal static void EnsureHeadlessGraphics()
+        {
+            EnsureHeadlessGameRunner();
+            if (Game1.graphics != null)
+                return;
+
+            // MonoGame's GraphicsAdapter.SupportedDisplayModes unconditionally asks
+            // SDL for the window's display index (SdlGameWindow.Instance.Handle) and
+            // re-enumerates modes unless the cached _displayIndex matches that value.
+            // Install an inert window shell and seed a one-entry mode list with the
+            // index SDL reports, so the getter returns the cached list.
+            Type sdlWindowType = typeof(Game).Assembly.GetType("Microsoft.Xna.Framework.SdlGameWindow")!;
+            FieldInfo? windowInstanceField = sdlWindowType.GetField("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (windowInstanceField?.GetValue(null) == null)
+            {
+                object windowShell = FormatterServices.GetUninitializedObject(FindConcreteShell(sdlWindowType));
+                sdlWindowType.GetField("_handle", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?.SetValue(windowShell, IntPtr.Zero);
+                windowInstanceField?.SetValue(null, windowShell);
+                Console.WriteLine("Mocked SdlGameWindow.Instance for headless display queries.");
+            }
+            int displayIndex = -1;
+            try
+            {
+                // MonoGame's SDL wrapper lives in the global namespace as the
+                // nested type Sdl+Display, so resolve it by name instead of by
+                // an assumed Microsoft.Xna.Framework prefix.
+                MethodInfo? getDisplayIndex = typeof(Game).Assembly.GetType("Sdl+Display")
+                    ?.GetMethod("GetWindowDisplayIndex", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (getDisplayIndex != null)
+                {
+                    displayIndex = (int)getDisplayIndex.Invoke(null, new object[] { IntPtr.Zero })!;
+                    Console.WriteLine($"Headless SDL display index probe returned {displayIndex}.");
+                }
+                else
+                {
+                    Console.WriteLine("Headless SDL display index probe unavailable; using sentinel index.");
+                }
+            }
+            catch (Exception probeEx)
+            {
+                Console.WriteLine($"Headless SDL display index probe failed; using sentinel index: {probeEx.Message}");
+            }
+            var modeCtor = typeof(DisplayMode).GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic, null,
+                new[] { typeof(int), typeof(int), typeof(SurfaceFormat) }, null);
+            var mode = (DisplayMode)modeCtor!.Invoke(new object[] { 1920, 1080, SurfaceFormat.Color });
+            // Both DisplayMode's and DisplayModeCollection's constructors are
+            // internal, so reflection flags are required to reach them.
+            var modes = (DisplayModeCollection)Activator.CreateInstance(typeof(DisplayModeCollection),
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null,
+                new object[] { new List<DisplayMode> { mode } }, null)!;
+            var adapterMock = (GraphicsAdapter)FormatterServices.GetUninitializedObject(typeof(GraphicsAdapter));
+            typeof(GraphicsAdapter).GetField("_supportedDisplayModes", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(adapterMock, modes);
+            typeof(GraphicsAdapter).GetField("_displayIndex", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(adapterMock, displayIndex);
+            var deviceMock = (GraphicsDevice)FormatterServices.GetUninitializedObject(typeof(GraphicsDevice));
+            typeof(GraphicsDevice).GetField("<Adapter>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(deviceMock, adapterMock);
+            // MonoGame's GraphicsDevice.GetRenderTargets() copies its backing array
+            // into a result array; on an uninitialized device that field is null and
+            // Array.Copy throws ArgumentNullException. Utility.getSafeArea() calls it
+            // whenever a menu computes its position, so seed empty arrays.
+            SeedEmptyArrays(deviceMock);
+            var gdmMock = (GraphicsDeviceManager)FormatterServices.GetUninitializedObject(typeof(GraphicsDeviceManager));
+            typeof(GraphicsDeviceManager).GetField("_graphicsDevice", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.SetValue(gdmMock, deviceMock);
+            Game1.graphics = gdmMock;
+            Console.WriteLine("Mocked Game1.graphics display chain for headless display queries.");
+        }
+
+        /// <summary>
+        /// Restores the persisted world from a vanilla save slot on startup: validates the
+        /// slot with <see cref="SaveGame.TryReadSaveFileWithFallback"/>, then pumps the
+        /// native <see cref="SaveGame.getLoadEnumerator(string)"/> pipeline, which rebuilds
+        /// the host farmer, farmhands, every location, world state, and weather exactly as
+        /// the retail game does. Returns false (caller falls back to a fresh world) when no
+        /// slot is configured/detected or the pipeline fails.
+        /// </summary>
+        /// <summary>
+        /// Set when a save slot existed but could not be read and the operator has not opted in
+        /// to starting fresh. Main turns this into a refusal to start: see HandleUnreadableSlot.
+        /// </summary>
+        internal static bool WorldLoadBlockedByUnreadableSlot { get; private set; }
+
+        /// <summary>The slot that blocked startup, for the operator-facing message.</summary>
+        internal static string BlockedSlotName { get; private set; } = string.Empty;
+
+        /// <summary>Size of a slot's main data file, for the startup slot listing (0 when absent).</summary>
+        private static long SlotDataFileSize(DirectoryInfo slot)
+        {
+            try
+            {
+                FileInfo dataFile = new FileInfo(Path.Combine(slot.FullName, slot.Name));
+                return dataFile.Exists ? dataFile.Length : 0L;
+            }
+            catch
+            {
+                return 0L;
+            }
+        }
+
+        internal static bool TryLoadWorldFromDisk()
+        {
+            string savesFolder = StardewValley.Program.GetSavesFolder();
+            string slotFolderName = string.Empty;
+            bool loadPumpStarted = false;
+            try
+            {
+                if (!Directory.Exists(savesFolder))
+                    return false;
+
+                slotFolderName = ServerConfig.Current.Paths.SaveSlotName;
+                if (string.IsNullOrWhiteSpace(slotFolderName))
+                {
+                    // Auto-detect: the newest slot folder for the configured farm name,
+                    // mirroring the layout vanilla creates (FarmName_<uniqueId>). Several slots
+                    // can match (every fresh world mints a new unique id), so report all of them:
+                    // silently restoring the newest one is how a test world can shadow the
+                    // player's real progress.
+                    string prefix = SaveGame.FilterFileName(ServerConfig.Current.World.FarmName) + "_";
+                    DirectoryInfo[] candidates = new DirectoryInfo(savesFolder)
+                        .GetDirectories(prefix + "*")
+                        .Where(d => !d.Name.Contains("_unloadable_", StringComparison.OrdinalIgnoreCase))
+                        .Where(d => File.Exists(Path.Combine(d.FullName, d.Name)))
+                        .OrderByDescending(d => d.LastWriteTime)
+                        .ToArray();
+                    slotFolderName = candidates.FirstOrDefault()?.Name;
+                    if (candidates.Length > 1)
+                    {
+                        Console.WriteLine($"[HeadlessSave] {candidates.Length} save slots match farm name '{ServerConfig.Current.World.FarmName}'; restoring the newest:");
+                        foreach (DirectoryInfo candidate in candidates)
+                        {
+                            Console.WriteLine($"[HeadlessSave]   {(candidate.Name == slotFolderName ? "->" : "  ")} {candidate.Name} " +
+                                $"({candidate.LastWriteTime:yyyy-MM-dd HH:mm}, {SlotDataFileSize(candidate):N0} bytes)");
+                        }
+                        Console.WriteLine("[HeadlessSave]   Set Paths.SaveSlotName to a specific slot name to restore that one instead.");
+                    }
+                }
+                if (string.IsNullOrWhiteSpace(slotFolderName) || !Directory.Exists(Path.Combine(savesFolder, slotFolderName)))
+                    return false;
+
+                // Options construction (during save deserialization) and every
+                // GraphicsDevice query forward to the mocked display chain.
+                EnsureHeadlessGraphics();
+
+                // Validate before pumping: getLoadEnumerator flips gameMode to 9 on failure,
+                // which would leave the half-initialized host in an error state.
+                SaveGame probe = SaveGame.TryReadSaveFileWithFallback(slotFolderName, out string error, out bool recovered);
+                if (probe == null)
+                {
+                    Console.WriteLine($"[HeadlessSave] Slot {slotFolderName} failed to load: {error}");
+                    // TryReadSaveFileWithFallback only reports the outer message, which
+                    // hides the element that actually failed. Re-run the raw deserialize
+                    // here so the full exception chain (with inner messages) is logged.
+                    try
+                    {
+                        string dataFile = Path.Combine(savesFolder, slotFolderName, slotFolderName);
+                        byte[] raw = File.ReadAllBytes(dataFile);
+                        using MemoryStream ms = new MemoryStream(raw, writable: false);
+                        if (ms.ReadByte() == 120) // zlib header; day-end saves are uncompressed
+                            throw new InvalidDataException("Compressed save not supported by probe");
+                        ms.Position = 0;
+                        SaveSerializer.Deserialize<SaveGame>(ms);
+                        Console.WriteLine("[HeadlessSave] Manual re-read succeeded (inconsistent failure).");
+                    }
+                    catch (Exception probeEx)
+                    {
+                        Console.WriteLine($"[HeadlessSave] Full failure detail: {probeEx}");
+                    }
+                    HandleUnreadableSlot(savesFolder, slotFolderName, loadPumpStarted: false);
+                    return false;
+                }
+                Console.WriteLine($"[HeadlessSave] Restoring world from slot {slotFolderName} (day={probe.dayOfMonth} year={probe.year})...");
+                if (recovered)
+                    Console.WriteLine("[HeadlessSave] Save file was corrupted; auto-recovered it from the backup.");
+
+                // getLoadEnumerator dereferences several statics that only the real Game1
+                // constructor creates (screenFade, dayTimeMoneyBox, ...). Install them
+                // before any vanilla code runs.
+                EnsureHeadlessCommonStatics();
+
+                // getLoadEnumerator applies several stages on background Tasks whenever
+                // LocalMultiplayer reports remote multiplayer, and rethrows task failures
+                // after the original stack trace has been reset. Record first-chance
+                // exceptions (with IL offsets) so a headless failure still reports its
+                // real origin.
+                var firstChance = new List<string>();
+                int firstChanceCount = 0;
+                EventHandler<FirstChanceExceptionEventArgs> capture = (_, args) =>
+                {
+                    firstChanceCount++;
+                    // Keep the most recent exceptions: vanilla retries throw-and-catch many
+                    // benign exceptions early, and the interesting one is the last.
+                    if (firstChance.Count >= 40)
+                        firstChance.RemoveAt(0);
+                    int ilOffset = -1;
+                    string origin = "<no stack trace>";
+                    try
+                    {
+                        StackTrace trace = new StackTrace(args.Exception);
+                        ilOffset = trace.GetFrame(0)?.GetILOffset() ?? -1;
+                        // Keep a few frames: the failing frame is often a framework method
+                        // whose caller is the only place that identifies the missing object.
+                        string[] frames = (args.Exception.StackTrace ?? string.Empty)
+                            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            .Select(line => line.Trim())
+                            .Take(4)
+                            .ToArray();
+                        if (frames.Length > 0)
+                            origin = string.Join(" <- ", frames);
+                    }
+                    catch
+                    {
+                        // Stack inspection is best effort only.
+                    }
+                    firstChance.Add($"{args.Exception.GetType().Name} IL_{ilOffset:X4} {origin}");
+                };
+                AppDomain.CurrentDomain.FirstChanceException += capture;
+                try
+                {
+                    // From here on the pipeline mutates Game1's statics (farm name, unique id,
+                    // date, locations), so a failure stops being recoverable by building a fresh
+                    // world in this process — see HandleUnreadableSlot.
+                    loadPumpStarted = true;
+                    IEnumerator<int> loader = SaveGame.getLoadEnumerator(slotFolderName);
+                    int steps = 0;
+                    while (loader != null && loader.MoveNext())
+                    {
+                        steps++;
+                    }
+                    Console.WriteLine($"[HeadlessSave] World load finished ({steps} steps): day={Game1.dayOfMonth} year={Game1.year} season={Game1.season} " +
+                        $"locations={Game1.locations.Count} farmhands={Game1.netWorldState.Value.farmhandData.Count()} host={Game1.player?.Name}");
+                }
+                catch (Exception loadEx)
+                {
+                    Console.WriteLine($"[HeadlessSave] Load pipeline threw: {loadEx}");
+                    DumpLoadFailureState();
+                    Console.WriteLine($"[HeadlessSave] First-chance exceptions ({firstChanceCount} total):");
+                    foreach (string origin in firstChance)
+                        Console.WriteLine($"[HeadlessSave]   {origin}");
+                    throw;
+                }
+                finally
+                {
+                    AppDomain.CurrentDomain.FirstChanceException -= capture;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HeadlessSave] World load failed: {ex}");
+                HandleUnreadableSlot(savesFolder, slotFolderName, loadPumpStarted);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// An existing slot could not be read, so the world in memory is not the player's world: a
+        /// partially applied load may already have taken over its farm name, unique id and date.
+        /// Building a fresh world on top of that is exactly how the original save got overwritten.
+        /// Default: refuse to start and leave every file untouched so the slot can be inspected.
+        /// Opt-in (World.StartFreshWhenSaveUnreadable): rename the unreadable slot aside, then let
+        /// the fallback world start — but only when the failure happened before the load pipeline
+        /// ran, because a half-applied load would make the fresh world itself corrupt.
+        /// </summary>
+        private static void HandleUnreadableSlot(string savesFolder, string slotFolderName, bool loadPumpStarted)
+        {
+            string slotPath = Path.Combine(savesFolder, slotFolderName);
+            if (ServerConfig.Current.World.StartFreshWhenSaveUnreadable && !loadPumpStarted)
+            {
+                PreserveUnloadableSlot(savesFolder, slotFolderName);
+                Console.WriteLine("[HeadlessSave] World.StartFreshWhenSaveUnreadable is true, so a fresh world starts in this " +
+                    "session; the slot above was renamed, never deleted, and can be restored by hand.");
+                return;
+            }
+
+            WorldLoadBlockedByUnreadableSlot = true;
+            BlockedSlotName = slotFolderName;
+            if (loadPumpStarted)
+            {
+                Console.WriteLine($"[HeadlessSave] !! Refusing to start: reading slot '{slotPath}' failed part-way through the vanilla " +
+                    "load pipeline, so this process already holds a half-applied mixture of the saved world and a new one. A fresh world " +
+                    "built on it would be corrupt and would save under this slot's farm name and date.");
+                Console.WriteLine("[HeadlessSave] !! The slot itself is untouched. To play a clean fresh world without touching it, set " +
+                    "Paths.SaveSlotName to a new, unused slot name and restart; otherwise repair or inspect the slot first.");
+                return;
+            }
+
+            Console.WriteLine($"[HeadlessSave] !! Refusing to start: the save slot '{slotPath}' exists but could not be read, and a " +
+                "fresh world would keep its farm name and unique id, so the next day-end save would overwrite the player's progress.");
+            Console.WriteLine("[HeadlessSave] !! Nothing on disk was modified. Inspect or repair that slot, point Paths.SaveSlotName at a " +
+                "different slot, or set World.StartFreshWhenSaveUnreadable to true to start fresh anyway (the slot is then renamed aside first).");
+        }
+
+        /// <summary>
+        /// Moves a save slot the vanilla load pipeline cannot read out of the way before the
+        /// caller falls back to a brand-new world. Without this the fallback world's
+        /// end-of-day save would overwrite the player's real progress in that slot, which is
+        /// the exact data loss this server must never cause. The folder is renamed, never
+        /// deleted, so it can be restored by hand; the new name is reported in the log.
+        /// </summary>
+        private static void PreserveUnloadableSlot(string savesFolder, string slotFolderName)
+        {
+            if (string.IsNullOrWhiteSpace(slotFolderName))
+                return;
+            try
+            {
+                string source = Path.Combine(savesFolder, slotFolderName);
+                if (!Directory.Exists(source))
+                    return;
+                string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string target = Path.Combine(savesFolder, $"{slotFolderName}_unloadable_{stamp}");
+                int suffix = 1;
+                while (Directory.Exists(target))
+                    target = Path.Combine(savesFolder, $"{slotFolderName}_unloadable_{stamp}_{suffix++}");
+                Directory.Move(source, target);
+                Console.WriteLine($"[HeadlessSave] !! The slot '{slotFolderName}' could not be read, so it was renamed to " +
+                    $"'{Path.GetFileName(target)}' instead of being overwritten by the fallback world. " +
+                    $"Rename it back to '{slotFolderName}' after fixing or inspecting the save.");
+            }
+            catch (Exception moveEx)
+            {
+                Console.WriteLine($"[HeadlessSave] !! Could not preserve unreadable slot '{slotFolderName}': {moveEx.Message}. " +
+                    "Move that folder aside by hand before the fallback world saves over it.");
+            }
+        }
+
+        /// <summary>
+        /// Probes the world state that the native load pipeline depends on, so a failure
+        /// inside the opaque iterator can be traced to the exact missing object without
+        /// guessing which vanilla source line threw.
+        /// </summary>
+        private static void DumpLoadFailureState()
+        {
+            void Report(string label, Func<string> probe)
+            {
+                try
+                {
+                    Console.WriteLine($"[HeadlessSave]   {label}: {probe()}");
+                }
+                catch (Exception probeException)
+                {
+                    Console.WriteLine($"[HeadlessSave]   {label}: probe threw {probeException.GetType().Name}: {probeException.Message}");
+                }
+            }
+
+            Console.WriteLine("[HeadlessSave] Load failure state dump:");
+            Report("null Game1 instance fields", () =>
+            {
+                object? game = typeof(Game1).GetField("game1", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
+                if (game == null)
+                    return "<no Game1.game1 instance>";
+                var nullFields = new List<string>();
+                foreach (FieldInfo field in typeof(Game1).GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    try
+                    {
+                        if (!field.FieldType.IsValueType && field.GetValue(game) == null)
+                            nullFields.Add(field.Name);
+                    }
+                    catch
+                    {
+                        // Fields that cannot be read are not interesting here.
+                    }
+                }
+                return $"{nullFields.Count} null fields: {string.Join(", ", nullFields)}";
+            });
+            Report("stage (Game1.loadingMessage)", () => Game1.loadingMessage ?? "<null>");
+            Report("Game1.year/uniqueID/gameMode", () => $"year={Game1.year} uniqueID={Game1.uniqueIDForThisGame} gameMode={Game1.gameMode} saveName={Game1.GetSaveGameName() ?? "<null>"}");
+            Report("save-fix flags", () =>
+            {
+                object? flag13 = typeof(Game1).GetField("hasApplied1_3_UpdateChanges", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
+                object? flag14 = typeof(Game1).GetField("hasApplied1_4_UpdateChanges", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
+                return $"hasApplied1_3={flag13} hasApplied1_4={flag14} lastFix={Game1.lastAppliedSaveFix}";
+            });
+            Report("Game1.locations", () => Game1.locations == null
+                ? "<null>"
+                : $"{Game1.locations.Count} entries [{string.Join(", ", Game1.locations.Take(4).Select(location => location?.NameOrUniqueName ?? "<null>"))}]");
+            Report("Game1.getFarm()", () => Game1.getFarm()?.NameOrUniqueName ?? "<null>");
+            Report("Game1.player", () => Game1.player == null
+                ? "<null>"
+                : $"{Game1.player.Name} uid={Game1.player.UniqueMultiplayerID} location={Game1.player.currentLocation?.NameOrUniqueName ?? "<null>"}");
+            Report("Game1.player.team", () => Game1.player?.team == null ? "<null>" : "ok");
+            Report("Game1.options", () => Game1.options == null ? "<null>" : "ok");
+            Report("Game1.netWorldState", () => Game1.netWorldState?.Value == null ? "<null>" : $"day={Game1.netWorldState.Value.Date.DayOfMonth} farmhands={Game1.netWorldState.Value.farmhandData.Count()}");
+            Report("farm.getShippingBin(player)", () =>
+            {
+                Farm? farm = Game1.getFarm();
+                if (farm == null)
+                    return "skipped (no farm)";
+                IList<Item> shippingBin = farm.getShippingBin(Game1.player);
+                return shippingBin == null ? "<null>" : $"{shippingBin.Count} items";
+            });
+            Report("Game1.getLocationFromName(Railroad)", () => Game1.getLocationFromName("Railroad")?.NameOrUniqueName ?? "<null>");
+        }
+
+        /// <summary>
+        /// Drives the native <see cref="SaveGame.Save()"/> coroutine to completion, writing
+        /// a full world save to the vanilla save directory. Vanilla runs this inside the
+        /// SaveGameMenu the host bypasses; pumping it after the overnight coroutine makes
+        /// world progress (day, farm objects, crops, world state) survive a restart.
+        /// </summary>
+        private static void TrySaveWorldToDisk()
+        {
+            try
+            {
+                // Vanilla computes the save slot from the host farmer's slotName; the
+                // new-game flow sets it via Game1.SetSaveName, which this host bypasses.
+                // SetSaveName expects the bare farm name (getSaveEnumerator appends the
+                // unique id itself; getLoadEnumerator strips everything after "_").
+                if (Game1.player != null && string.IsNullOrEmpty(Game1.player.slotName))
+                    Game1.SetSaveName(ServerConfig.Current.World.FarmName);
+                Console.WriteLine(DescribeNewDayState("before-worldsave"));
+                IEnumerator<int>? saver = SaveGame.Save();
+                int steps = 0;
+                while (saver != null && saver.MoveNext())
+                {
+                    steps++;
+                }
+                Console.WriteLine($"[HeadlessSave] World save enumerator finished ({steps} steps), slot={Game1.player?.slotName}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HeadlessSave] World save failed: {ex}");
+            }
         }
 
         /// <summary>
