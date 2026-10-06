@@ -945,6 +945,35 @@ namespace HeadlessServer
         }
 
         /// <summary>
+        /// Applies the deferred "farmhand finished character customization" work: starter seeds
+        /// plus an immediate farmhand save. The work was deferred because it arrived while a day
+        /// roll was running, when touching farmhand state or the disk would race the roll's
+        /// worker mid-save.
+        /// </summary>
+        internal static void FlushPendingCustomizationSaves()
+        {
+            if (pendingCustomizationSaves.Count == 0)
+                return;
+            foreach (long id in pendingCustomizationSaves)
+            {
+                if (savedFarmerIds.Contains(id))
+                    continue;
+                Farmer? farmer = Game1.GetPlayer(id);
+                if (farmer == null || !farmer.isCustomized.Value)
+                {
+                    Console.WriteLine($"[Protocol] Skipping deferred customization save for farmhand {id}: farmer not found or not customized.");
+                    continue;
+                }
+                // Ensure every newly-created farmhand carries the configured starter seeds.
+                GiveStarterParsnipSeeds(farmer);
+                Console.WriteLine($"Farmer {farmer.Name} ({farmer.UniqueMultiplayerID}) completed customization during a day roll. Saving...");
+                SaveFarmhand(farmer);
+                savedFarmerIds.Add(id);
+            }
+            pendingCustomizationSaves.Clear();
+        }
+
+        /// <summary>
         /// Creates the inert GameRunner singleton the headless host needs: an uninitialized
         /// instance holding an empty gameInstances list (LocalMultiplayer.IsLocalMultiplayer
         /// dereferences it) and a window shell (Options' ctor detaches its resize handler).

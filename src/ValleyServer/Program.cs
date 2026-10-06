@@ -53,6 +53,13 @@ namespace HeadlessServer
         // Set while a day roll is running so the main loop can notice the transition back and clean
         // up state that belongs to the finished roll.
         private static bool rollWasActive = false;
+        // Farmhands that finished character customization while a day roll was running: the
+        // starter-seed gift and farmhand save must not touch farmer state or the disk while the
+        // roll's worker is mid-save, so they wait until the roll has finished.
+        private static readonly HashSet<long> pendingCustomizationSaves = new();
+        // One-shot log switch for DedicatedServer.Tick failures (its headless-incompatible
+        // ReadyCheckDialog construction throws in the narrow window before the roll starts).
+        private static bool dedicatedTickErrorLogged = false;
         static readonly FieldInfo gamePlayerField = typeof(Game1).GetField("_player", BindingFlags.Static | BindingFlags.NonPublic)
             ?? throw new MissingFieldException(typeof(Game1).FullName, "_player");
 
@@ -686,6 +693,15 @@ namespace HeadlessServer
                 Console.WriteLine("Initialized Game1._onlineFarmers for headless ready checks.");
             }
 
+            // The host renders nothing, but vanilla's chat receivers (Multiplayer.receiveChatMessage
+            // for typed chat, receiveChatInfoMessage for system chat) forward every message into
+            // Game1.chatBox, whose headless inert fonts then crash (live51: "Error processing
+            // message 15" NRE from ChatBox.addInfoMessage). Both receivers are explicitly
+            // null-guarded by vanilla, and vanilla itself clears chatBox on exit-to-title, so a
+            // null box is a supported state: the guards turn host-side chat rendering into a no-op
+            // while chat still reaches real clients through the relay paths.
+            Game1.chatBox = null;
+
             Console.WriteLine("Game1 static fields mocked successfully!");
 
             // 4. Initialize Lidgren NetServer
@@ -1121,7 +1137,16 @@ namespace HeadlessServer
                                             // "sleep" check actually exists on the server after each such message.
                                             bool isReadyMsg = incomingMsg.MessageType == 31;
                                             var mp = typeof(Game1).GetField("multiplayer", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)?.GetValue(null) as Multiplayer;
-                                            bool deferToOvernightWorker = headlessNewDayActive && incomingMsg.MessageType is 14 or 31;
+                                            // While a day roll is active, vanilla applies every incoming message on
+                                            // the single game thread at the roll's barrier pumps (the world is frozen
+                                            // for clients). Applying any type here on the main thread while the worker
+                                            // reads and writes the same farmer and location roots is the same
+                                            // double-writer race that corrupted a NetEvent queue (live51, day 8:
+                                            // "Collection was modified" in AbstractNetEvent1.Write), so defer ALL
+                                            // types. The raw-byte relay below still runs immediately: it is a pure
+                                            // socket write, like the worker's own barrier sends on the same Lidgren
+                                            // connection.
+                                            bool deferToOvernightWorker = headlessNewDayActive;
                                             if (deferToOvernightWorker)
                                             {
                                                 deferredOvernightMessages.Enqueue(ProtocolMessages.Clone(incomingMsg));
@@ -1143,11 +1168,24 @@ namespace HeadlessServer
                                             var farmer = incomingMsg.SourceFarmer;
                                              if (farmer != null && farmer.UniqueMultiplayerID != 99999999L && farmer.UniqueMultiplayerID != 0 && farmer.isCustomized.Value && !savedFarmerIds.Contains(farmer.UniqueMultiplayerID))
                                             {
-                                                // Ensure every newly-created farmhand carries the configured starter seeds.
-                                                GiveStarterParsnipSeeds(farmer);
-                                                Console.WriteLine($"Farmer {farmer.Name} ({farmer.UniqueMultiplayerID}) completed customization. Saving...");
-                                                SaveFarmhand(farmer);
-                                                savedFarmerIds.Add(farmer.UniqueMultiplayerID);
+                                                if (deferToOvernightWorker)
+                                                {
+                                                    // A farmhand can finish character customization while a day roll is
+                                                    // running (its connection is not part of the sleep barrier). Touching
+                                                    // farmhand state or the disk now would race the roll's worker
+                                                    // mid-save, so run the seed gift + farmhand save after the roll
+                                                    // finishes instead.
+                                                    pendingCustomizationSaves.Add(farmer.UniqueMultiplayerID);
+                                                    Console.WriteLine($"[Protocol] Deferred customization save for farmhand {farmer.UniqueMultiplayerID} until the day roll finishes.");
+                                                }
+                                                else
+                                                {
+                                                    // Ensure every newly-created farmhand carries the configured starter seeds.
+                                                    GiveStarterParsnipSeeds(farmer);
+                                                    Console.WriteLine($"Farmer {farmer.Name} ({farmer.UniqueMultiplayerID}) completed customization. Saving...");
+                                                    SaveFarmhand(farmer);
+                                                    savedFarmerIds.Add(farmer.UniqueMultiplayerID);
+                                                }
                                             }
 
                                             // Rebroadcast client broadcast messages to other clients
@@ -1269,15 +1307,43 @@ namespace HeadlessServer
                                  // and overnight sync messages still queued belong to a dead generation.
                                  rollWasActive = false;
                                  PumpPendingFarmhandRegistrations();
+                                 FlushPendingCustomizationSaves();
                                  DropStaleDeferredOvernightMessages();
                              }
                              mp.UpdateEarly();
-                             Game1.dedicatedServer?.Tick();
+                             // Vanilla's dedicated-host sleep path (DedicatedServer.HostSleepInBed)
+                             // constructs a ReadyCheckDialog whose fonts are inert headless shells, so
+                             // Tick throws once the "everyone else is sleeping" check passes (live51:
+                             // "[MultiplayerSync] First UpdateEarly/UpdateLate failure"). Its functional
+                             // half — creating the "sleep" ready check — completes before the throw,
+                             // and PrepareHeadlessHostForSleep below finishes the host's readiness, so
+                             // isolate the failure: unhandled, it skipped netReady/Prepare/Pump/
+                             // UpdateLate for the tick.
+                             try
+                             {
+                              Game1.dedicatedServer?.Tick();
+                             }
+                             catch (Exception tickEx)
+                             {
+                              if (!dedicatedTickErrorLogged)
+                              {
+                                  dedicatedTickErrorLogged = true;
+                                  Console.WriteLine($"[DedicatedTick] First DedicatedServer.Tick failure: {tickEx}");
+                              }
+                             }
                              Game1.netReady?.Update();
                              EnsureHeadlessDedicatedHostFlag();
                              PrepareHeadlessHostForSleep();
-                             PumpHeadlessNewDayProcess();
                              mp.UpdateLate();
+                             // Start the day roll LAST. PumpHeadlessNewDayProcess flips
+                             // headlessNewDayActive synchronously and immediately spawns the worker,
+                             // whose first barrier starts writing location and farmer roots. Any
+                             // netcode call after that point in the same tick — the UpdateLate that
+                             // used to sit here — becomes a second concurrent writer on the same
+                             // roots and corrupts a NetEvent queue (live51, day 8: "Collection was
+                             // modified" in AbstractNetEvent1.Write while both threads broadcast
+                             // the SeedShop root).
+                             PumpHeadlessNewDayProcess();
                          }
                      }
                     }
