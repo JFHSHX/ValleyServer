@@ -364,6 +364,7 @@ namespace HeadlessServer
                 if (timeOfDay % 100 == 60) timeOfDay += 40;
                 if (timeOfDay % 100 == 90) timeOfDay -= 40;
                 Game1.timeOfDay = Math.Min(timeOfDay, 2600);
+                EnsureHeadlessFestivalKnowledge();
 
                 try
                 {
@@ -413,6 +414,14 @@ namespace HeadlessServer
 
         private static bool hostSleepTriggered = false;
         private static int lastLogReady = -1, lastLogRequired = -1;
+        private static int lastLogFestivalReady = -1, lastLogFestivalRequired = -1;
+        private static string? festivalKnowledgeDay = null;
+        private static string? festivalDataErrorDay = null;
+        private static long lastFestivalWarpAttemptMs = 0;
+        private static int festivalWindowStart = -1;
+        private static int festivalWindowEnd = -1;
+        private static string? festivalWarpHoldLoggedDay = null;
+        private static string? festivalWarpClosedLoggedDay = null;
 
         private static void EnsureHeadlessDedicatedHostFlag()
         {
@@ -445,9 +454,21 @@ namespace HeadlessServer
 
             // Festivals also gate on a ready check; the invisible host must say yes
             // or single-player clients hang on "waiting for players" forever.
+            // Vanilla judges this with DedicatedServer.CheckOthersReady: every required
+            // player except the host is ready (numberReady >= numberRequired - 1). Derive
+            // the host's vote from that same rule instead of our own connection bookkeeping:
+            // the client displays "ready/required" with the invisible host already subtracted
+            // (ServerReadyCheck.Update sends num2 - 1 for a dedicated host), so a live client
+            // stuck on "1/1" is exactly the state where the host's own vote is still missing.
             int festReady = Game1.netReady.GetNumberReady("festivalStart");
             int festRequired = Game1.netReady.GetNumberRequired("festivalStart");
-            if (festRequired > 0 && festReady >= clientConnections.Count)
+            if (festReady != lastLogFestivalReady || festRequired != lastLogFestivalRequired)
+            {
+                lastLogFestivalReady = festReady;
+                lastLogFestivalRequired = festRequired;
+                LogFestivalDiagnostics(festReady, festRequired);
+            }
+            if (festRequired > 0 && festReady >= Math.Max(1, festRequired - 1))
             {
                 Game1.netReady.SetLocalReady("festivalStart", true);
             }
@@ -539,6 +560,319 @@ namespace HeadlessServer
                         }
                     }
                 }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Vanilla learns where today's festival is inside Game1.performTenMinuteClockUpdate
+        /// ("if (weatherIcon == 1) { ...; whereIsTodaysFest = conditions[0]; }"). Our headless
+        /// clock replaces that method, so without this the dedicated host never knows a festival
+        /// is on: DedicatedServer.Tick never warps it in, the host never answers the festival
+        /// main-event dialogue, and a client can be left at "waiting for players". Runs at most
+        /// once per game day and only when the day was flagged as a festival day.
+        /// </summary>
+        private static void EnsureHeadlessFestivalKnowledge(string? forcedDay = null)
+        {
+            try
+            {
+                // weatherIcon is set to 1 by the day-roll setup, but after a restart mid-festival-day
+                // it can be stale — live57 loaded a "Festival" weather day with weatherIcon=2. Trust
+                // the calendar as well as the icon so a restarted server still learns the festival.
+                if (forcedDay == null && Game1.weatherIcon != 1 && !Utility.isFestivalDay()) return;
+                string day = forcedDay ?? (Game1.currentSeason + Game1.dayOfMonth);
+                if (festivalKnowledgeDay == day) return;
+                var data = Game1.temporaryContent?.Load<Dictionary<string, string>>("Data\\Festivals\\" + day);
+                if (data == null || !data.TryGetValue("conditions", out string? conditions)) return;
+                string[] parts = conditions.Split('/');
+                if (parts.Length > 1)
+                {
+                    string[] window = parts[1].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (window.Length > 0 && int.TryParse(window[0], out int windowStart)) festivalWindowStart = windowStart;
+                    if (window.Length > 1 && int.TryParse(window[1], out int windowEnd)) festivalWindowEnd = windowEnd;
+                }
+                if (Game1.whereIsTodaysFest == null)
+                {
+                    Game1.whereIsTodaysFest = parts[0];
+                }
+                festivalKnowledgeDay = day;
+                Console.WriteLine($"[Festival] {day} is a festival day: whereIsTodaysFest={Game1.whereIsTodaysFest}, window={parts[1]}, time={Game1.timeOfDay}");
+            }
+            catch (Exception ex)
+            {
+                string day = forcedDay ?? (Game1.currentSeason + Game1.dayOfMonth);
+                if (festivalDataErrorDay != day)
+                {
+                    festivalDataErrorDay = day;
+                    Console.WriteLine($"[Festival] Failed to read festival data for {day}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Headless half of the festival handling that a real dedicated host gets from
+        /// DedicatedServer.Tick: once the real farmhands are ready for "festivalStart"
+        /// (vanilla's CheckOthersReady rule), move the invisible host into the festival so the
+        /// event actually runs for it. Game1.warpFarmer defers a multiplayer festival warp
+        /// behind a ReadyCheckDialog ("weatherIcon == 1 &amp;&amp; whereIsTodaysFest != null
+        /// &amp;&amp; ... &amp;&amp; !warpingForForcedRemoteEvent") and this host never pumps menus,
+        /// so the warp runs with that vanilla flag set — the same bypass vanilla uses for
+        /// forced remote events.
+        /// </summary>
+        private static void PumpHeadlessFestival(bool force = false)
+        {
+            try
+            {
+                if (Game1.dedicatedServer == null || Game1.netReady == null) return;
+                if (!Game1.HasDedicatedHost) return;
+                if (headlessNewDayActive) return;
+                string? festival = Game1.whereIsTodaysFest;
+                if (festival == null) return;
+                // The festival only exists on the map once it opens: entering the location runs
+                // GameLocation.resetForPlayerEntry -> checkForEvents -> Event.tryToLoadFestival,
+                // which requires timeOfDay to be inside the window. Warping the host in early
+                // leaves it standing in an empty location with no event, and the festival then
+                // never starts. Wait for the window exactly like a player would.
+                if (!force && festivalWindowStart > 0 && Game1.timeOfDay < festivalWindowStart)
+                {
+                    string today = Game1.currentSeason + Game1.dayOfMonth;
+                    if (festivalWarpHoldLoggedDay != today)
+                    {
+                        festivalWarpHoldLoggedDay = today;
+                        Console.WriteLine($"[Festival] Holding the host warp until '{festival}' opens at {festivalWindowStart} (time={Game1.timeOfDay}).");
+                    }
+                    return;
+                }
+                // And never warp in once the window has closed: on summer11 the pump fired at
+                // time=1400, the exact end of the Luau window, so the host faded into a beach that
+                // had no festival on it and the festival never set itself up.
+                if (!force && festivalWindowEnd > 0 && Game1.timeOfDay >= festivalWindowEnd)
+                {
+                    string today = Game1.currentSeason + Game1.dayOfMonth;
+                    if (festivalWarpClosedLoggedDay != today)
+                    {
+                        festivalWarpClosedLoggedDay = today;
+                        Console.WriteLine($"[Festival] Not warping the host into '{festival}': its window closed at {festivalWindowEnd} (time={Game1.timeOfDay}).");
+                    }
+                    return;
+                }
+                // A dialog may already exist (DedicatedServer.Tick attempted the same warp).
+                if (PumpHeadlessReadyCheckDialog()) return;
+                if (Game1.CurrentEvent != null || Game1.eventUp) return;
+                if (Game1.currentLocation != null && Game1.currentLocation.NameOrUniqueName == festival) return;
+                if (!force && Environment.TickCount64 - lastFestivalWarpAttemptMs < 5000) return;
+                int ready = Game1.netReady.GetNumberReady("festivalStart");
+                int required = Game1.netReady.GetNumberRequired("festivalStart");
+                if (!force)
+                {
+                    if (ready <= 0 || Game1.netReady.IsReady("festivalStart")) return;
+                    if (ready < required - 1) return;
+                }
+                lastFestivalWarpAttemptMs = Environment.TickCount64;
+                LocationRequest request = Game1.getLocationRequest(festival);
+                int x = -1;
+                int y = -1;
+                Utility.getDefaultWarpLocation(festival, ref x, ref y);
+                Console.WriteLine($"[Festival] Warping the host into '{festival}' at {x},{y} (time={Game1.timeOfDay}, ready={ready}/{required}).");
+                bool forced = Game1.warpingForForcedRemoteEvent;
+                Game1.warpingForForcedRemoteEvent = true;
+                try
+                {
+                    Game1.warpFarmer(request, x, y, 2);
+                }
+                finally
+                {
+                    Game1.warpingForForcedRemoteEvent = forced;
+                }
+                Console.WriteLine($"[Festival] Host is now at {Game1.currentLocation?.NameOrUniqueName} (event={Game1.CurrentEvent?.id ?? "(none)"}).");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Festival] Host festival warp failed: {ex.Message}");
+            }
+        }
+
+        private static bool warpPumpErrorLogged = false;
+
+        /// <summary>One-shot guard for failures raised inside the ScreenFade callbacks.</summary>
+        private static bool fadeCallbackErrorLogged = false;
+
+        /// <summary>True once the headless fade instance with vanilla callbacks replaced the null field.</summary>
+        private static bool headlessScreenFadeInstalled = false;
+
+        private static readonly HashSet<string> warpPumpSkipLogged = new HashSet<string>();
+
+        private static void LogWarpPumpSkip(string reason)
+        {
+            if (warpPumpSkipLogged.Add(reason))
+            {
+                Console.WriteLine($"[HeadlessWarp] Pump skipped: {reason}");
+            }
+        }
+
+        /// <summary>
+        /// ScreenFade callback wired into the headless fade instance. The host Game1 is created
+        /// through FormatterServices.GetUninitializedObject, so vanilla never ran the constructor
+        /// that binds these callbacks; without them ScreenFade.UpdateFade ends its cycle (alpha
+        /// -0.2, fadeToBlack false) while the warp is silently dropped and Game1.locationRequest
+        /// keeps pointing at the destination forever. Game1.onFadeToBlackComplete is what actually
+        /// swaps Game1.currentLocation, calls resetForPlayerEntry (which loads the festival event)
+        /// and clears the request, so delegate to the real method.
+        /// </summary>
+        private static bool InvokeVanillaFadeToBlackComplete()
+        {
+            try
+            {
+                MethodInfo? complete = typeof(Game1).GetMethod("onFadeToBlackComplete", BindingFlags.Instance | BindingFlags.NonPublic);
+                object? instance = Game1.game1;
+                if (complete == null || instance == null)
+                {
+                    if (!fadeCallbackErrorLogged)
+                    {
+                        fadeCallbackErrorLogged = true;
+                        Console.WriteLine($"[HeadlessWarp] Cannot complete fade: onFadeToBlackComplete method={complete != null}, Game1.game1={instance != null}.");
+                    }
+                    return false;
+                }
+                return complete.Invoke(instance, null) is true;
+            }
+            catch (TargetInvocationException ex)
+            {
+                if (!fadeCallbackErrorLogged)
+                {
+                    fadeCallbackErrorLogged = true;
+                    Console.WriteLine($"[HeadlessWarp] onFadeToBlackComplete threw: {ex.InnerException}");
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                if (!fadeCallbackErrorLogged)
+                {
+                    fadeCallbackErrorLogged = true;
+                    Console.WriteLine($"[HeadlessWarp] onFadeToBlackComplete failed: {ex.GetType().Name}: {ex.Message}");
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Counterpart of <see cref="InvokeVanillaFadeToBlackComplete"/>. Vanilla's
+        /// onFadedBackInComplete restores player.CanMove (FadeScreenToBlack stopped the host) and
+        /// then calls checkForRunButton, which only feeds the run-key UI: reimplement the part that
+        /// has state, skip the part that needs a keyboard.
+        /// </summary>
+        private static void InvokeVanillaFadeBackInComplete()
+        {
+            try
+            {
+                if (Game1.player != null)
+                {
+                    Game1.player.CanMove = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!fadeCallbackErrorLogged)
+                {
+                    fadeCallbackErrorLogged = true;
+                    Console.WriteLine($"[HeadlessWarp] Restoring CanMove after fade failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Completes a host warp that Game1.warpFarmer prepared but that a headless host would
+        /// never finish: performWarpFarmer sets fadeToBlackAlpha = 1.1f for a dedicated host and
+        /// the location switch itself happens in Game1.Update -> ScreenFade.UpdateFade, which this
+        /// server never runs. Two fade ticks suffice (the first normalizes the alpha to 1.2 for a
+        /// dedicated host, the second fires onFadeToBlackComplete). Skipped while a day roll is
+        /// running, because that path routes through the same fade callback (newDayAfterFade) and
+        /// must stay owned by the overnight worker.
+        /// </summary>
+        private static void PumpHeadlessWarp()
+        {
+            try
+            {
+                if (headlessNewDayActive || Game1.newDay) return;
+                if (!Game1.IsDedicatedHost)
+                {
+                    LogWarpPumpSkip($"not-dedicated-host(isServer={Game1.IsServer},hasDedicatedHost={Game1.HasDedicatedHost})");
+                    return;
+                }
+                if (!Game1.fadeToBlack)
+                {
+                    LogWarpPumpSkip($"fadeToBlack=false(locationRequest={Game1.locationRequest?.Name ?? "(null)"},alpha={Game1.fadeToBlackAlpha})");
+                    return;
+                }
+                object? fade = typeof(Game1).GetField("screenFade", BindingFlags.Static | BindingFlags.NonPublic)?.GetValue(null);
+                if (fade == null)
+                {
+                    LogWarpPumpSkip("Game1.screenFade field not found");
+                    return;
+                }
+                MethodInfo? update = fade.GetType().GetMethod("UpdateFade", BindingFlags.Instance | BindingFlags.Public);
+                if (update == null)
+                {
+                    LogWarpPumpSkip($"{fade.GetType().Name}.UpdateFade not found");
+                    return;
+                }
+                LocationRequest? pending = Game1.locationRequest;
+                update.Invoke(fade, new object[] { new Microsoft.Xna.Framework.GameTime(TimeSpan.Zero, TimeSpan.FromMilliseconds(16)) });
+                if (pending != null && Game1.locationRequest == null)
+                {
+                    Console.WriteLine($"[HeadlessWarp] Completed host warp to {Game1.currentLocation?.NameOrUniqueName ?? "(null)"} (event={Game1.CurrentEvent?.id ?? "(none)"}).");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!warpPumpErrorLogged)
+                {
+                    warpPumpErrorLogged = true;
+                    Console.WriteLine($"[HeadlessWarp] Fade pump failed: {ex}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// The headless host has no menu pump, so a ReadyCheckDialog assigned to
+        /// Game1.activeClickableMenu would sit there forever: its update() is what votes yes and
+        /// what performs the deferred action (for a festival warp, the actual warp) once the
+        /// check finishes. Reproduce that update() for checks the host must answer but never
+        /// drives itself; sleep/ready_for_save/wakeup are handled explicitly elsewhere.
+        /// </summary>
+        private static bool PumpHeadlessReadyCheckDialog()
+        {
+            if (Game1.activeClickableMenu is not StardewValley.Menus.ReadyCheckDialog dialog) return false;
+            string check = dialog.checkName;
+            if (check is "sleep" or "ready_for_save" or "wakeup") return false;
+            try
+            {
+                Game1.netReady?.SetLocalReady(check, true);
+                if (Game1.netReady?.IsReady(check) ?? false)
+                {
+                    Console.WriteLine($"[Festival] Ready check '{check}' is satisfied; confirming the headless dialog.");
+                    dialog.confirm();
+                    if (ReferenceEquals(Game1.activeClickableMenu, dialog))
+                    {
+                        Game1.activeClickableMenu = null;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Festival] Failed to pump ready-check dialog '{check}': {ex.Message}");
+            }
+            return true;
+        }
+
+        /// <summary>Logs the whole festival gate whenever its ready-check numbers change, so a
+        /// live "stuck at waiting for players" session tells us which condition blocked.</summary>
+        private static void LogFestivalDiagnostics(int festReady, int festRequired)
+        {
+            try
+            {
+                Console.WriteLine($"[Festival][dbg] ready={festReady}/{festRequired} isReady={Game1.netReady?.IsReady("festivalStart")} newDay={Game1.newDay} eventUp={Game1.eventUp} weatherIcon={Game1.weatherIcon} whereIsTodaysFest={Game1.whereIsTodaysFest ?? "(null)"} hostLoc={Game1.currentLocation?.NameOrUniqueName} clients=[{string.Join(",", clientConnections.Keys)}]");
             }
             catch { }
         }
@@ -1026,13 +1360,17 @@ namespace HeadlessServer
             // Game1.nonWarpFade / fadeToBlack / globalFade all forward to this private
             // ScreenFade instance; a null one made Game1.loadForNewGame throw an NRE on its
             // very first statements (and Game1.NewDay threw later, after newDay was set).
-            // Its state is plain fields and its callbacks are never invoked because headless
-            // never runs UpdateFade, so a real instance with inert callbacks is safe.
+            // Its state is plain fields, but the callbacks are NOT inert: PumpHeadlessWarp
+            // drives UpdateFade to finish host warps, and only the real callbacks perform the
+            // location switch. The host Game1 comes from GetUninitializedObject, so no
+            // constructor ever bound them and they must be installed here.
             FieldInfo? screenFadeField = typeof(Game1).GetField("screenFade", BindingFlags.Static | BindingFlags.NonPublic);
-            if (screenFadeField != null && screenFadeField.GetValue(null) == null)
+            if (screenFadeField != null && !headlessScreenFadeInstalled)
             {
-                screenFadeField.SetValue(null, new StardewValley.BellsAndWhistles.ScreenFade(() => false, () => { }));
-                Console.WriteLine("Mocked Game1.screenFade for headless fade writes.");
+                screenFadeField.SetValue(null, new StardewValley.BellsAndWhistles.ScreenFade(
+                    InvokeVanillaFadeToBlackComplete, InvokeVanillaFadeBackInComplete));
+                headlessScreenFadeInstalled = true;
+                Console.WriteLine("Installed Game1.screenFade with vanilla fade callbacks for headless warps.");
             }
 
             // Game1.loadForNewGame constructs the ChatBox, whose constructor assigns
@@ -1336,6 +1674,87 @@ namespace HeadlessServer
             }
         }
 
+        /// <summary>
+        /// A farmhand's home is stored in the save as a cabin unique name such as
+        /// "FarmHousef55aec0b-c6d7-4e5c-ac6c-3fb707ef3567". When that cabin no longer exists -- the
+        /// world was rebuilt, or the slot was restored from a different copy -- the stored name is a
+        /// dangling reference, and any vanilla code that walks every farmer's home dies with
+        /// "KeyNotFoundException: Required location 'FarmHouse&lt;guid&gt;' not found."
+        /// (Utility.getHomeOfFarmer -> Game1.RequireLocation). Farmer.hasPet() calls it and
+        /// GameLocation.checkForEvents calls hasPet, so the exception aborts location entry: on
+        /// summer11 the host's festival warp threw inside onFadeToBlackComplete and the Luau never
+        /// had any grounds. Repoint each unresolvable home at the cabin that belongs to that
+        /// farmhand (matched through farmhandReference), else at an empty cabin, else the host house.
+        /// </summary>
+        private static void RepairFarmerHomeLocations()
+        {
+            try
+            {
+                if (Game1.locations == null) return;
+                // Every home this world actually has: the host's farmhouse, plus one entry per cabin.
+                var homes = new List<(string Name, long OwnerId)>();
+                foreach (GameLocation location in Game1.locations)
+                {
+                    if (location is FarmHouse house && !(location is Cabin))
+                    {
+                        homes.Add((house.NameOrUniqueName, house.OwnerId));
+                    }
+                    foreach (var building in location.buildings)
+                    {
+                        if (building?.GetIndoors() is Cabin cabin)
+                        {
+                            homes.Add((cabin.NameOrUniqueName, cabin.farmhandReference.UID));
+                        }
+                    }
+                }
+                if (homes.Count == 0) return;
+
+                var farmers = new List<Farmer>();
+                if (Game1.player != null) farmers.Add(Game1.player);
+                foreach (Farmer online in Game1.otherFarmers.Values)
+                {
+                    if (online != null && !farmers.Contains(online)) farmers.Add(online);
+                }
+                foreach (Farmer stored in Game1.netWorldState.Value.farmhandData.Values)
+                {
+                    if (stored != null && !farmers.Contains(stored)) farmers.Add(stored);
+                }
+
+                foreach (Farmer farmer in farmers)
+                {
+                    string home = farmer.homeLocation.Value;
+                    if (!string.IsNullOrEmpty(home) && Game1.getLocationFromName(home) != null) continue;
+                    string? replacement = null;
+                    foreach ((string name, long ownerId) in homes)
+                    {
+                        if (ownerId != 0 && ownerId == farmer.UniqueMultiplayerID)
+                        {
+                            replacement = name;
+                            break;
+                        }
+                    }
+                    if (replacement == null)
+                    {
+                        foreach ((string name, long ownerId) in homes)
+                        {
+                            if (ownerId == 0)
+                            {
+                                replacement = name;
+                                break;
+                            }
+                        }
+                    }
+                    if (replacement == null) replacement = "FarmHouse";
+                    Console.WriteLine($"[HomeRepair] {farmer.Name} ({farmer.UniqueMultiplayerID}) had home '{home}', which is not a location in this world; repointing it at '{replacement}'.");
+                    farmer.homeLocation.Value = replacement;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HomeRepair] Failed to repair farmhand home locations: {ex.Message}");
+            }
+        }
+
         internal static bool TryLoadWorldFromDisk()
         {
             string savesFolder = StardewValley.Program.GetSavesFolder();
@@ -1467,6 +1886,9 @@ namespace HeadlessServer
                     }
                     Console.WriteLine($"[HeadlessSave] World load finished ({steps} steps): day={Game1.dayOfMonth} year={Game1.year} season={Game1.season} " +
                         $"locations={Game1.locations.Count} farmhands={Game1.netWorldState.Value.farmhandData.Count()} host={Game1.player?.Name}");
+                    // A restored slot may point a farmhand at a cabin that no longer exists; anything
+                    // that walks farmer homes (hasPet, festival setup) would then throw mid-entry.
+                    RepairFarmerHomeLocations();
                 }
                 catch (Exception loadEx)
                 {

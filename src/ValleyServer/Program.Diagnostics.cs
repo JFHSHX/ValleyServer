@@ -27,6 +27,8 @@ namespace HeadlessServer
 
         private static long commandFilePosition = 0;
 
+        private static bool commandFileStartupChecked = false;
+
         private static void RegisterDiagnosticCommands()
         {
             commandRegistry.Register(new ServerCommand(
@@ -64,15 +66,112 @@ namespace HeadlessServer
 
             commandRegistry.Register(new ServerCommand(
                 name: "roll",
-                usage: "roll",
-                description: "Forces an overnight NewDay roll (host sleeps immediately, no clients needed).",
-                handler: _ => ForceDayRoll()));
+                usage: "roll [force]",
+                description: "Forces an overnight NewDay roll. Refuses while no client is connected unless 'roll force' is given.",
+                handler: a => ForceDayRoll(a.Length > 0 && string.Equals(a[0], "force", StringComparison.OrdinalIgnoreCase))));
 
             commandRegistry.Register(new ServerCommand(
                 name: "housediag",
                 usage: "housediag",
                 description: "Lists cabin/farmhouse interiors and furniture counts.",
                 handler: _ => HouseDiag()));
+
+            commandRegistry.Register(new ServerCommand(
+                name: "festival",
+                usage: "festival [status|learn|warp] [seasonDay]",
+                description: "Reports today's festival state. 'learn [seasonDay]' reads Data\\Festivals (optionally for a forced day such as spring24) and sets whereIsTodaysFest; 'warp' also force-moves the host into the festival (headless self-test).",
+                handler: a => FestivalDiag(a.Length > 0 ? a[0] : "status", a.Length > 1 ? a[1] : null)));
+
+            commandRegistry.Register(new ServerCommand(
+                name: "homes",
+                usage: "homes",
+                description: "Lists every farmhouse/cabin home and every farmer's homeLocation with its resolution result.",
+                handler: _ => HomesDiag()));
+        }
+
+        private static void DescribeFarmerHome(string source, Farmer? farmer)
+        {
+            if (farmer == null)
+            {
+                Console.WriteLine($"[HomesDiag]   {source}: (null farmer)");
+                return;
+            }
+            string home = farmer.homeLocation.Value ?? "";
+            string resolution = "(empty)";
+            if (!string.IsNullOrEmpty(home))
+            {
+                GameLocation? resolved = Game1.getLocationFromName(home);
+                resolution = resolved != null ? $"OK -> '{resolved.NameOrUniqueName}' ({resolved.GetType().Name})" : "NOT FOUND";
+            }
+            Console.WriteLine($"[HomesDiag]   {source}: {farmer.Name} (id={farmer.UniqueMultiplayerID}) home='{home}' {resolution}");
+        }
+
+        private static void HomesDiag()
+        {
+            try
+            {
+                Console.WriteLine($"[HomesDiag] === homes in this world (day={Game1.dayOfMonth} {Game1.season} y{Game1.year}) ===");
+                foreach (GameLocation location in Game1.locations)
+                {
+                    if (location is StardewValley.Locations.FarmHouse house && !(location is StardewValley.Locations.Cabin))
+                        Console.WriteLine($"[HomesDiag]   farmhouse '{house.NameOrUniqueName}' ownerId={house.OwnerId}");
+                    foreach (StardewValley.Buildings.Building? building in location.buildings)
+                    {
+                        if (building?.GetIndoors() is StardewValley.Locations.Cabin cabin)
+                            Console.WriteLine($"[HomesDiag]   cabin '{cabin.NameOrUniqueName}' farmhandRef={cabin.farmhandReference.UID} refDefined={cabin.farmhandReference.Value != null} ownerId={cabin.OwnerId}");
+                    }
+                }
+
+                Console.WriteLine("[HomesDiag] === Game1.player (what the repair walk sees first) ===");
+                DescribeFarmerHome("player", Game1.player);
+
+                Console.WriteLine("[HomesDiag] === Game1.otherFarmers.Values ===");
+                int online = 0;
+                foreach (Farmer farmer in Game1.otherFarmers.Values)
+                {
+                    DescribeFarmerHome("otherFarmers", farmer);
+                    online++;
+                }
+                Console.WriteLine($"[HomesDiag]   (otherFarmers count={online})");
+
+                Console.WriteLine("[HomesDiag] === Game1.netWorldState.Value.farmhandData.Values ===");
+                int catalog = 0;
+                foreach (Farmer farmer in Game1.netWorldState.Value.farmhandData.Values)
+                {
+                    DescribeFarmerHome("farmhandData", farmer);
+                    catalog++;
+                }
+                Console.WriteLine($"[HomesDiag]   (farmhandData count={catalog})");
+
+                Console.WriteLine("[HomesDiag] === Game1.getAllFarmers() (what hasPet() walks) ===");
+                foreach (Farmer farmer in Game1.getAllFarmers())
+                    DescribeFarmerHome("allFarmers", farmer);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HomesDiag] Failed: {ex}");
+            }
+        }
+
+        private static void FestivalDiag(string mode, string? forcedDay = null)
+        {
+            try
+            {
+                if (mode is "learn" or "warp")
+                {
+                    festivalKnowledgeDay = null;
+                    EnsureHeadlessFestivalKnowledge(forcedDay);
+                }
+                if (mode == "warp")
+                {
+                    PumpHeadlessFestival(force: true);
+                }
+                Console.WriteLine($"[FestivalDiag] season={Game1.currentSeason} day={Game1.dayOfMonth} time={Game1.timeOfDay} weatherIcon={Game1.weatherIcon} whereIsTodaysFest={Game1.whereIsTodaysFest ?? "(null)"} hostLoc={Game1.currentLocation?.NameOrUniqueName ?? "(null)"} event={Game1.CurrentEvent?.id ?? "(none)"} isFestival={Game1.CurrentEvent?.isFestival.ToString() ?? "-"} festivalStart={Game1.netReady?.GetNumberReady("festivalStart")}/{Game1.netReady?.GetNumberRequired("festivalStart")} sleep={Game1.netReady?.GetNumberReady("sleep")}/{Game1.netReady?.GetNumberRequired("sleep")} warp=[dedicated={Game1.IsDedicatedHost} isServer={Game1.IsServer} hasHostFlag={Game1.HasDedicatedHost} newDay={Game1.newDay} fadeToBlack={Game1.fadeToBlack} alpha={Game1.fadeToBlackAlpha} locRequest={Game1.locationRequest?.Name ?? "(null)"}]");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[FestivalDiag] {mode} failed: {ex.Message}");
+            }
         }
 
         private static void HouseDiag()
@@ -95,6 +194,23 @@ namespace HeadlessServer
         {
             try
             {
+                // server-commands.txt is an operator channel for a RUNNING server. Content that
+                // already exists when this process starts is stale: on 2026-10-07 a redeploy
+                // copied a leftover "roll" line from the build output into the deploy folder and
+                // the fresh process replayed it, advancing the world two days with nobody
+                // connected. Report and drop such content instead of executing it.
+                if (!commandFileStartupChecked)
+                {
+                    commandFileStartupChecked = true;
+                    if (File.Exists(commandFilePath) && new FileInfo(commandFilePath).Length > 0)
+                    {
+                        string stale = File.ReadAllText(commandFilePath);
+                        string oneLine = stale.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                        Console.WriteLine($"[Commands] Ignoring command file content left over from a previous run: {oneLine}");
+                        Console.WriteLine("[Commands] Write commands to server-commands.txt once the server is up; each line is consumed exactly once.");
+                        File.WriteAllText(commandFilePath, string.Empty);
+                    }
+                }
                 if (!File.Exists(commandFilePath))
                     return;
                 var info = new FileInfo(commandFilePath);
@@ -323,11 +439,16 @@ namespace HeadlessServer
             Console.WriteLine($"[Probe] done: {name} now in {npc.currentLocation?.Name} pos={npc.Position}");
         }
 
-        private static void ForceDayRoll()
+        private static void ForceDayRoll(bool force = false)
         {
             if (Game1.newDay || headlessNewDayActive)
             {
                 Console.WriteLine("[Roll] A day roll is already in progress; refusing.");
+                return;
+            }
+            if (!force && clientConnections.Count == 0)
+            {
+                Console.WriteLine("[Roll] Refusing to roll the day: no client is connected, so nobody would play it. Use 'roll force' to roll an empty world.");
                 return;
             }
             Console.WriteLine($"[Roll] Forcing overnight NewDay from day {Game1.dayOfMonth} {Game1.timeOfDay}...");

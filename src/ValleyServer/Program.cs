@@ -1011,6 +1011,11 @@ namespace HeadlessServer
                                          // Ensure the farmhand is bound to a cabin before any spawn/pass-out handling.
                                          // This must happen after registration so NetFarmerRef can resolve it.
                                          EnsureFarmhandHomesAndBeds(Game1.getFarm());
+                                         // The farmhand XML this player was loaded from may still point at a cabin
+                                         // that no longer exists (the world was rebuilt at some point); that stale
+                                         // home throws KeyNotFoundException inside Farmer.hasPet -> checkForEvents
+                                         // and kills festival entry. Repoint it now that the farmer is registered.
+                                         RepairFarmerHomeLocations();
 
 
                                          // A transport-level Connected status isn't an active player yet. Only
@@ -1339,6 +1344,8 @@ namespace HeadlessServer
                              Game1.netReady?.Update();
                              EnsureHeadlessDedicatedHostFlag();
                              PrepareHeadlessHostForSleep();
+                             PumpHeadlessFestival();
+                             PumpHeadlessWarp();
                              mp.UpdateLate();
                              // Start the day roll LAST. PumpHeadlessNewDayProcess flips
                              // headlessNewDayActive synchronously and immediately spawns the worker,
